@@ -1,6 +1,14 @@
 # CivitAI to Obsidian Image Library Builder
 
-This script automatically fetches example images from CivitAI models/LoRAs along with all their generation parameters and creates a comprehensive Obsidian markdown documentation page.
+Problem: When you pull down a new Model or Lora from CivitAI that you with to use it is helpful to also pull down example images and their generation paramaters to reference so you 
+can see what the model / Lora is capable of and what styles it is able to produce. Obsidian is a very good option for this type of documentation but the documentation process can be 
+incredably time consuming if done manually. 
+
+Solution: This script automatically fetches example images from CivitAI models/LoRAs along with all their generation parameters and creates a comprehensive Obsidian markdown 
+documentation page for you.
+
+<img width="2157" height="1981" alt="image" src="https://github.com/user-attachments/assets/a12cd072-7d45-48b5-83db-be7f2ce2ccde" />
+
 
 ## Features
 
