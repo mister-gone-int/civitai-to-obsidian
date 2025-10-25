@@ -1,0 +1,77 @@
+# CivitAI to Obsidian Configuration
+# Copy this file to config.yaml and customize for your setup
+
+# Obsidian vault configuration
+obsidian:
+  # Path to your Obsidian vault
+  vault_path: "/path/to/your/obsidian/vault"
+
+  # Media folder structure (relative to vault root)
+  media_folder: "zzMedia/Model and Lora Example Images"
+
+  # Base directory for notes (relative to vault root)
+  base_directory: "Diffusion"
+
+  # Directory structure by base model
+  directories:
+    flux: "1 - FLUX"
+    sdxl: "3 - SDXL"
+    sd15: "2 - SD15"
+    pony: "4 - PONY"
+    illust: "5 - ILLUST"
+    other: "9 - Other"
+
+  # Subdirectories by model type
+  type_directories:
+    lora: "Lora"
+    checkpoint: "Models"
+    textualinversion: "Embeddings"
+    other: "Other"
+
+# CivitAI API configuration
+civitai:
+  # Your CivitAI API key (optional, but recommended for higher rate limits)
+  # Get one at: https://civitai.com/user/account
+  api_key: null
+
+  # API base URL (don't change unless CivitAI changes their API)
+  base_url: "https://civitai.com/api/v1"
+
+# Rate limiting configuration
+rate_limits:
+  # Delay between image downloads in seconds
+  download_delay: 2.0
+
+  # Delay between API calls in seconds
+  api_delay: 1.5
+
+  # Maximum retries for failed requests
+  max_retries: 3
+
+  # Backoff factor for retries
+  backoff_factor: 1
+
+# Default fetch options
+defaults:
+  # Default number of images to fetch
+  image_limit: 200
+
+  # Default sort order: "Most Reactions", "Newest", "Most Comments"
+  sort_order: "Most Reactions"
+
+  # Default time period: "AllTime", "Year", "Month", "Week", "Day"
+  time_period: "AllTime"
+
+  # NSFW filter: "all", "allow", "block"
+  nsfw_filter: "all"
+
+# Metadata configuration
+metadata:
+  # Author name for generated notes
+  author: "Your Name"
+
+  # Base tags to include in all notes
+  base_tags:
+    - "diffusion"
+    - "ai"
+    - "civitai"
