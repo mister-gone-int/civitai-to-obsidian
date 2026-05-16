@@ -52,6 +52,19 @@ except ImportError as _imerr:  # pragma: no cover — install-state check
     )
     raise
 
+# piexif 1.1.3 has a TIFF-spec compliance bug in its sub-IFD writer
+# (no 4-byte next-IFD pointer between entries and value payloads).
+# Strict EXIF readers reject the output. We patch the writer at
+# import time so every code path that calls piexif.dump produces
+# compliant bytes. See _exif_writer.py for the full rationale.
+from _exif_writer import (
+    install_piexif_patches,
+    splice_exif_app1,
+    validate_subifd_compliance,
+    ExifSpliceError,
+)
+install_piexif_patches()
+
 # Interactive mode is opt-in via --interactive; keep the import soft so a
 # user who never touches that flag doesn't need questionary installed.
 try:
@@ -956,14 +969,30 @@ def _atomic_replace(tmp: Path, target: Path) -> None:
     os.replace(tmp, target)
 
 
-def _maybe_backup(path: Path, enabled: bool) -> Optional[Path]:
-    """Copy the original to `<name>.civitai-orig` once, if backups are
-    on. Subsequent calls don't overwrite an existing backup — that
+def _maybe_backup(
+    path: Path,
+    enabled: bool,
+    backup_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Copy the original to a `.civitai-orig` backup once, if backups
+    are on. Subsequent calls don't overwrite an existing backup — that
     would lose the true original after a second apply.
+
+    Default layout (backup_dir=None) places the backup as a sibling
+    next to the original: `<name>.civitai-orig`.
+
+    When backup_dir is set, the backup goes to
+    `<backup_dir>/<parent_folder_name>/<name>.civitai-orig` — keeps
+    the source folder clean and groups backups by model folder.
     """
     if not enabled:
         return None
-    bk = path.with_name(path.name + ".civitai-orig")
+    if backup_dir is not None:
+        sub = backup_dir / path.parent.name
+        sub.mkdir(parents=True, exist_ok=True)
+        bk = sub / (path.name + ".civitai-orig")
+    else:
+        bk = path.with_name(path.name + ".civitai-orig")
     if not bk.exists():
         shutil.copy2(path, bk)
     return bk
@@ -1030,6 +1059,16 @@ def _verify_jpeg_after_write(
     if actual != expected_params:
         raise EmbedError(
             "round-trip mismatch: written UserComment not readable back"
+        )
+    # Strict-EXIF compliance: refuse to ship a file whose sub-IFD
+    # layout would trip a spec-strict reader (kamadak-exif, exiv2
+    # strict). Catches any future regression in the piexif-dump
+    # monkey-patch before it can land on disk.
+    compliance_issues = validate_subifd_compliance(tmp.read_bytes())
+    if compliance_issues:
+        raise EmbedError(
+            "strict-EXIF compliance check failed: "
+            + "; ".join(compliance_issues)
         )
 
 
@@ -1132,8 +1171,15 @@ def _write_jpeg_with_parameters(
 
     tmp = path.with_name(path.name + ".tmp.civitai-meta")
     try:
-        shutil.copy2(path, tmp)
-        piexif.insert(exif_bytes, str(tmp))
+        # Splice the new EXIF APP1 into a byte-perfect copy of the
+        # original. Unlike piexif.insert (which drops APP0 JFIF on
+        # most JPEGs), splice_exif_app1 preserves every other segment
+        # verbatim — compressed scan data included. The original file
+        # is read; the tempfile is written from scratch.
+        original_bytes = path.read_bytes()
+        new_bytes = splice_exif_app1(original_bytes, exif_bytes)
+        with open(tmp, "wb") as f:
+            f.write(new_bytes)
         with Image.open(path) as orig:
             expected_size = orig.size
         _verify_jpeg_after_write(tmp, expected_size, params_string)
@@ -1182,6 +1228,7 @@ def enrich_file(
     *,
     dry_run: bool = False,
     backup: bool = False,
+    backup_dir: Optional[Path] = None,
 ) -> EnrichResult:
     """Merge api_meta into the file at `path`, non-destructively.
 
@@ -1303,7 +1350,7 @@ def enrich_file(
         )
 
     try:
-        _maybe_backup(path, backup)
+        _maybe_backup(path, backup, backup_dir)
         if fmt == "png":
             _write_png_with_parameters(path, new_params)
         else:

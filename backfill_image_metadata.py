@@ -221,6 +221,15 @@ def main() -> None:
              "to the same file leave the existing backup alone.",
     )
     parser.add_argument(
+        "--backup-dir", default=None,
+        help="Directory under which `.civitai-orig` backups are "
+             "written, with one subfolder per source folder "
+             "(<backup-dir>/<folder-name>/<file>.civitai-orig). "
+             "Keeps source folders clean. Without this, backups land "
+             "as siblings next to the original. Implies --backup. "
+             "Can also be set via `backfill.backup_dir` in config.",
+    )
+    parser.add_argument(
         "--scope", default=None,
         help='Glob pattern matched against folder names — restricts '
              'the scan to matching model folders. '
@@ -275,6 +284,18 @@ def main() -> None:
     config = load_config(args.config)
     obs = config.get("obsidian", {})
 
+    # Resolve backup-dir: CLI flag wins, then config's
+    # backfill.backup_dir, otherwise None (sibling-file backups).
+    # Setting a backup-dir implies --backup so the user doesn't
+    # have to pass both flags.
+    backup_dir_raw = args.backup_dir or (
+        config.get("backfill", {}).get("backup_dir")
+    )
+    backup_dir: Optional[Path] = None
+    if backup_dir_raw:
+        backup_dir = Path(backup_dir_raw).expanduser().resolve()
+        args.backup = True  # implied
+
     if args.folder:
         single_folder = Path(args.folder).expanduser().resolve()
         if not single_folder.is_dir():
@@ -326,7 +347,12 @@ def main() -> None:
     print(f"   API delay:      {args.api_delay}s")
     print(f"   Skip complete:  {args.skip_complete}")
     if args.apply and args.backup:
-        print(f"   Backups:        enabled (.civitai-orig)")
+        if backup_dir is not None:
+            print(f"   Backups:        enabled → {backup_dir}/"
+                  f"<folder>/<file>.civitai-orig")
+        else:
+            print(f"   Backups:        enabled (sibling "
+                  f".civitai-orig)")
     print()
 
     if args.folder:
@@ -386,6 +412,7 @@ def main() -> None:
                 api_meta,
                 dry_run=not args.apply,
                 backup=args.backup,
+                backup_dir=backup_dir,
             )
             by_status[result.status] += 1
             folder_counter[result.status] += 1

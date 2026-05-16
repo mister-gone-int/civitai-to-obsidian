@@ -84,6 +84,17 @@ defaults:
     # - '\bplz\s+tip\b'
     # - '\bfollow\s+me\s+for\s+more'
 
+# Settings for backfill_image_metadata.py — the standalone tool
+# that patches generation metadata into previously-downloaded images.
+backfill:
+  # Where to write `.civitai-orig` rollback backups when --backup is
+  # used. With this set, each backup lands under
+  # <backup_dir>/<source-folder-name>/<file>.civitai-orig, keeping
+  # the source folders clean. Unset (or null) → backups land as
+  # siblings next to the original file (legacy behavior).
+  # backup_dir: "/absolute/path/to/your/image-backups"
+  backup_dir: null
+
 # Metadata configuration
 metadata:
   # Author name for generated notes
