@@ -125,6 +125,32 @@ class CivitAIFetcher:
 
         return response.json()
 
+    # Magic byte signatures for supported image formats.
+    # Videos and other formats are intentionally excluded — we filter
+    # them out at the API level and as a defense in depth on download.
+    _IMAGE_SIGNATURES = (
+        (b'\xff\xd8\xff', 'jpeg'),
+        (b'\x89PNG\r\n\x1a\n', 'png'),
+        (b'GIF87a', 'gif'),
+        (b'GIF89a', 'gif'),
+    )
+
+    @staticmethod
+    def detect_image_extension(head: bytes) -> Optional[str]:
+        """Detect image extension from file magic bytes.
+
+        Returns the extension (without leading dot) for supported image
+        formats, or None for unknown/unsupported formats including
+        videos.
+        """
+        for sig, ext in CivitAIFetcher._IMAGE_SIGNATURES:
+            if head.startswith(sig):
+                return ext
+        # WEBP: RIFF....WEBP
+        if len(head) >= 12 and head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+            return 'webp'
+        return None
+
     def get_model_images(
         self,
         model_data: Dict[str, Any],
@@ -207,9 +233,21 @@ class CivitAIFetcher:
                 data = response.json()
                 items = data.get("items", [])
 
-                if items:
-                    all_images.extend(items)
-                    print(f"  ✓ Got {len(items)} images")
+                # Filter out videos — CivitAI hosts MP4 clips alongside
+                # images, but we only embed images in Obsidian.
+                image_items = [
+                    i for i in items if i.get("type", "image") == "image"
+                ]
+                skipped = len(items) - len(image_items)
+
+                if image_items:
+                    all_images.extend(image_items)
+                    suffix = (
+                        f" (skipped {skipped} video(s))" if skipped else ""
+                    )
+                    print(f"  ✓ Got {len(image_items)} images{suffix}")
+                elif skipped:
+                    print(f"  All {skipped} items were videos — skipped")
                 else:
                     print("  No images for this version")
 
@@ -225,20 +263,41 @@ class CivitAIFetcher:
 
         return all_images[:limit]
 
-    def download_image(self, url: str, output_path: Path) -> bool:
-        """Download an image from URL to local path"""
+    def download_image(
+        self,
+        url: str,
+        output_dir: Path,
+        image_id: Any
+    ) -> Optional[Path]:
+        """Download an image and save with extension inferred from bytes.
+
+        The CivitAI CDN serves files whose URL extension doesn't always
+        match the actual content (a URL ending in .jpeg may be a PNG),
+        so we sniff the magic bytes and pick the extension ourselves.
+        Returns the final saved Path, or None if the download failed or
+        the content wasn't a supported image format (e.g. video).
+        """
         try:
             response = self.session.get(url, stream=True, timeout=30)
             response.raise_for_status()
 
-            with open(output_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+            content = response.content
+            ext = self.detect_image_extension(content[:16])
+            if ext is None:
+                print(
+                    f"  ⏭️  Skipping {image_id}: unsupported format "
+                    f"(magic={content[:8].hex()})"
+                )
+                return None
 
-            return True
+            output_path = output_dir / f"{image_id}.{ext}"
+            with open(output_path, 'wb') as f:
+                f.write(content)
+
+            return output_path
         except Exception as e:
             print(f"Failed to download {url}: {e}")
-            return False
+            return None
 
 
 class ObsidianPageGenerator:
@@ -320,6 +379,53 @@ class ObsidianPageGenerator:
         name = re.sub(r'[<>:"/\\|?*]', '_', name)
         name = re.sub(r'\s+', '_', name)
         return name
+
+    @staticmethod
+    def sanitize_folder_name(name: str) -> str:
+        """Sanitize a folder name for cross-platform filesystems.
+
+        Unlike sanitize_filename, this keeps spaces and parentheses
+        intact because folder names are primarily for humans browsing
+        the vault. Strips characters that are invalid on Windows/macOS
+        and trims trailing dots/spaces (also a Windows constraint).
+        """
+        name = re.sub(r'[/\\:*?"<>|]', '_', name)
+        name = re.sub(r'\s+', ' ', name).strip()
+        name = name.rstrip('. ')
+        return name or 'unnamed'
+
+    @classmethod
+    def build_image_folder_name(
+        cls,
+        model_data: Dict[str, Any],
+        specific_version_id: Optional[int]
+    ) -> str:
+        """Construct the image folder name for this download.
+
+        Format: `{model_name} ({version_name})` when a specific
+        version was requested, else just `{model_name}`. Falls back
+        to ID-based names when the API has no human name.
+        """
+        model_id = model_data.get('id')
+        model_name = model_data.get('name') or f'[unnamed-{model_id}]'
+
+        if specific_version_id is None:
+            return cls.sanitize_folder_name(model_name)
+
+        version = next(
+            (
+                v for v in model_data.get('modelVersions', [])
+                if v.get('id') == specific_version_id
+            ),
+            None
+        )
+        version_name = (
+            (version.get('name') if version else None)
+            or f'v{specific_version_id}'
+        )
+        return cls.sanitize_folder_name(
+            f'{model_name} ({version_name})'
+        )
 
     def detect_base_model(
         self,
@@ -537,6 +643,23 @@ class ObsidianPageGenerator:
 
         return "\n\n".join(sections)
 
+    # Extensions we consider when looking up the on-disk filename for
+    # an image id, in priority order.
+    _IMAGE_EXTENSIONS = ("jpeg", "jpg", "png", "webp", "gif")
+
+    @classmethod
+    def find_image_filename(
+        cls,
+        images_folder: Path,
+        image_id: Any
+    ) -> Optional[str]:
+        """Return the actual on-disk filename for an image id, or None."""
+        for ext in cls._IMAGE_EXTENSIONS:
+            candidate = images_folder / f"{image_id}.{ext}"
+            if candidate.exists():
+                return candidate.name
+        return None
+
     def generate_page(
         self,
         model_data: Dict[str, Any],
@@ -636,10 +759,17 @@ class ObsidianPageGenerator:
         for idx, image_data in enumerate(images_data, 1):
             image_id = image_data.get("id", idx)
 
+            # Look up the actual file on disk so we use the right
+            # extension (the CDN serves PNG/WEBP/JPEG interchangeably).
+            # Fall back to .jpeg only when nothing was downloaded —
+            # e.g. running with --skip-download for a dry preview.
+            image_filename = self.find_image_filename(
+                images_folder, image_id
+            ) or f"{image_id}.jpeg"
+
             lines.append(f"#### Image {idx}\n")
 
             # Image embed - using relative path from vault root
-            image_filename = f"{image_id}.jpeg"
             media_rel = self.config.get("obsidian", {}).get(
                 "media_folder",
                 "zzMedia/Model and Lora Example Images"
@@ -870,11 +1000,11 @@ def main() -> None:
             f"({len(images_with_meta)} with generation metadata)"
         )
 
-        # Create folder for images using model_id and version_id
-        if model_version_id:
-            folder_name = f"{model_id}_v{model_version_id}"
-        else:
-            folder_name = str(model_id)
+        # Create folder for images, named after the model so the user
+        # can tell what's in each folder when browsing the vault.
+        folder_name = ObsidianPageGenerator.build_image_folder_name(
+            model_data, model_version_id
+        )
         images_folder = generator.media_folder / folder_name
         images_folder.mkdir(parents=True, exist_ok=True)
         print(f"📁 Images will be saved to: {images_folder}")
@@ -889,23 +1019,27 @@ def main() -> None:
                     continue
 
                 image_id = image_data.get("id", idx)
-                image_filename = f"{image_id}.jpeg"
-                image_path = images_folder / image_filename
-
-                if image_path.exists():
+                existing = ObsidianPageGenerator.find_image_filename(
+                    images_folder, image_id
+                )
+                if existing:
                     print(
                         f"  [{idx}/{len(images_data)}] ⏭️  Skipping "
-                        f"(already exists): {image_filename}"
+                        f"(already exists): {existing}"
                     )
                     downloaded += 1
                     continue
 
                 print(
                     f"  [{idx}/{len(images_data)}] 📥 Downloading: "
-                    f"{image_filename}"
+                    f"{image_id}"
                 )
-                if fetcher.download_image(image_url, image_path):
+                saved = fetcher.download_image(
+                    image_url, images_folder, image_id
+                )
+                if saved:
                     downloaded += 1
+                    print(f"      → saved as {saved.name}")
 
                 # User-configurable rate limiting
                 time.sleep(download_delay)
