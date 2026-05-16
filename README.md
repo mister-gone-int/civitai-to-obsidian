@@ -14,6 +14,9 @@ This script does the work for you. Give it a model URL or ID and it will fetch e
 - Writes an Obsidian markdown page with YAML frontmatter (tags, author, source link, creator, downloads, rating, upload date)
 - Detects the base model (FLUX, SDXL, SD 1.5, Pony, Illustrious) and files the note in the matching subdirectory
 - Skips images that have already been downloaded, so reruns are cheap
+- Refreshes existing notes with `--update`, appending only genuinely new images and adding an `updated:` date to the frontmatter
+- Requires generation metadata by default so your library doesn't fill up with meta-less duds (toggle with `--no-require-meta`)
+- Filters out Buzz tip-begging spam (`buzz please`, `give me buzz`, `#buzzfarming`, etc) before download, with an extensible pattern list in config
 - Filters NSFW content if you want a SFW-only library
 - Captures LoRA stacks from user-generated images, including filenames and weights
 - Retries failed requests with backoff and applies configurable rate limits
@@ -125,6 +128,29 @@ python civitai_to_obsidian.py "https://civitai.com/models/1155749?modelVersionId
 
 To find the version ID, click the version dropdown on the model page and copy the URL from the address bar.
 
+### Refreshing an existing note with new images
+
+Months after the initial download, models often accumulate new high-quality examples from the community. Pass `--update` to append a dated batch of fresh images to an existing note without touching the original content:
+
+```bash
+python civitai_to_obsidian.py 12345 --update
+```
+
+In `--update` mode the script:
+
+- Locates the existing `.md` (same path and filename rules as a normal run)
+- Reads the image IDs already referenced by `![[...]]` embeds in the note **and** scans the on-disk image folder, then unions both sets — anything in either is treated as already-seen and won't be re-added
+- Defaults to `--sort Newest --period Month` (you can still override either explicitly)
+- Downloads only the new images
+- Appends a new `## Example Images — Update YYYY-MM-DD` section to the bottom of the note
+- Adds or refreshes an `updated: YYYY-MM-DD` field in the YAML frontmatter
+
+If no existing note is found at the expected path, the script exits with an error rather than creating one — run without `--update` to do the initial fetch first.
+
+If every image returned by the API is already in the note (i.e. nothing new to add), the script reports that and exits without modifying the file. Try `--sort Newest --period AllTime` or raise `--limit` to widen the search.
+
+Reruns are safe: running `--update` twice on the same day just adds a second dated section (or, if nothing new came in between, a no-op message).
+
 ### Sorting
 
 ```bash
@@ -134,6 +160,35 @@ python civitai_to_obsidian.py 12345 --sort "Most Comments"
 ```
 
 `Newest` is the better choice when you want to see how other people are stacking LoRAs, since user uploads tend to include more varied prompt and LoRA combinations than the creator's own examples.
+
+### Quality filters
+
+Two filters run by default to keep the library clean:
+
+**Require generation metadata** — drops any image returned by the API that has no `meta` block (no prompt, no sampler, nothing usable). The whole point of the library is to have prompts you can copy, so meta-less images are duds. Toggle:
+
+```bash
+python civitai_to_obsidian.py 12345 --no-require-meta    # keep meta-less images
+```
+
+**Begging filter** — drops images whose prompt contains tip-begging language for CivitAI's Buzz currency: `buzz please`, `buzz pls`, `need buzz`, `give me buzz`, `spare buzz`, `yellow buzz appreciated`, `#buzzfarming`, `support me with buzz`, and variants. Patterns are word-boundary aware so legitimate text like `buzzcut`, `the buzz around this lora`, or `buzz lightyear` is not affected. Toggle:
+
+```bash
+python civitai_to_obsidian.py 12345 --no-filter-begging  # keep begging images
+```
+
+Both filters can also be toggled in config under `defaults.require_meta` and `defaults.filter_begging`.
+
+To extend the begging filter without editing code, add regex patterns to `defaults.begging_patterns_extra` in `config.yaml`. They run on top of the built-in patterns, case-insensitively, against the prompt and negative prompt:
+
+```yaml
+defaults:
+  begging_patterns_extra:
+    - '\bplz\s+tip\b'
+    - '\bfollow\s+me\s+for\s+more'
+```
+
+When the begging filter trips, the run prints the first few matched image IDs and prompt excerpts so you can sanity-check the patterns aren't being overzealous.
 
 ### NSFW filter
 
@@ -153,6 +208,9 @@ python civitai_to_obsidian.py 12345 --limit 300               # fetch more image
 python civitai_to_obsidian.py 12345 --vault-path /some/path   # override vault path
 python civitai_to_obsidian.py 12345 --delay 3.0 --api-delay 2.0  # back off on rate limits
 python civitai_to_obsidian.py 12345 --skip-download           # generate the page without downloading
+python civitai_to_obsidian.py 12345 --update                  # append fresh images to an existing note
+python civitai_to_obsidian.py 12345 --no-require-meta         # don't require generation metadata
+python civitai_to_obsidian.py 12345 --no-filter-begging       # don't filter out buzz-begging prompts
 python civitai_to_obsidian.py 12345 --config /some/config.yaml
 ```
 
@@ -299,8 +357,8 @@ Add an API key, or raise `--delay` and `--api-delay`. The script retries 429s wi
 **Images aren't showing up in Obsidian**
 Check that `vault_path` is correct and that the media folder exists in your vault. Make sure "Use [[Wikilinks]]" is enabled under Settings → Files & Links. If links resolve to the wrong file, try toggling "New link format" between "Shortest path when possible" and "Absolute path in vault".
 
-**Lots of images come back without metadata**
-That's normal for user uploads. The script reports `Fetched X images (Y with generation metadata)` so you can see how many had usable params. Switch to `--sort "Most Reactions"` if you want creator examples (those almost always have metadata), or raise `--limit` to cast a wider net.
+**Final image count is much lower than `--limit`**
+By default the script drops images without generation metadata and images whose prompts look like Buzz-begging spam. The funnel summary at the top of the run shows how many were dropped at each stage. Switch to `--sort "Most Reactions"` for creator examples (those almost always have metadata), raise `--limit` to cast a wider net, or pass `--no-require-meta` / `--no-filter-begging` to relax the filters.
 
 **The model has multiple base model versions and the wrong one is being detected**
 Use the URL form with `?modelVersionId=<id>` to pin the version explicitly. Without it, the script uses the first version returned by the API, which is usually but not always the latest one.

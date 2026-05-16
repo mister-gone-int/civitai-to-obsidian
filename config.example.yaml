@@ -65,6 +65,25 @@ defaults:
   # NSFW filter: "all", "allow", "block"
   nsfw_filter: "all"
 
+  # Skip images that have no generation metadata (prompt, sampler,
+  # etc). On by default — a library of meta-less duds isn't useful as
+  # a reference. Override per run with --no-require-meta.
+  require_meta: true
+
+  # Drop images whose prompts look like Buzz tip-begging
+  # ("buzz please", "give me buzz", "#buzzfarming", etc).
+  # On by default. Override per run with --no-filter-begging.
+  filter_begging: true
+
+  # Additional regex patterns to apply on top of the built-in
+  # begging filter. Each entry is a Python regex; matching is
+  # case-insensitive and runs against the prompt + negative prompt.
+  # Use this when new spam phrases start showing up and you don't
+  # want to wait for a built-in update.
+  begging_patterns_extra: []
+    # - '\bplz\s+tip\b'
+    # - '\bfollow\s+me\s+for\s+more'
+
 # Metadata configuration
 metadata:
   # Author name for generated notes

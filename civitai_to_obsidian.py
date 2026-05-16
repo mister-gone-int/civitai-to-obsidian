@@ -30,6 +30,88 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
+# CivitAI's tipping currency is called "Buzz", and a steady stream of
+# low-effort images get posted with prompts like "buzz please" or
+# "give me buzz" in an attempt to farm tips. These patterns target
+# that genre. They're case-insensitive and word-boundary aware so
+# they don't catch legitimate uses like "buzzcut" or "fuzz".
+DEFAULT_BEGGING_PATTERNS: List[str] = [
+    # "buzz please/pls/me/up/appreciated/welcome/thanks" — bare buzz
+    # paired with a begging cue. Allows optional punctuation between
+    # the two words (e.g. "buzz, please").
+    r'\bbuzz\s*[,.\-!?]*\s*'
+    r'(please|pls|plz|me|up|appreciated|welcome|thanks|thx|ty)\b',
+    # "please [give|send|share|tip|drop|spare] buzz" — please before
+    # the optional verb; the verb is optional so "please buzz" hits.
+    r'\bplease\s+(give|send|share|tip|drop|spare)?\s*'
+    r'(some\s+|a\s+|me\s+)?buzz\b',
+    # "{need|gimme|give me|send|send me|spare|drop} buzz" with optional
+    # filler ("some buzz", "a buzz", "more buzz").
+    r'\b(need|gimme|give\s+me|send(?:\s+me)?|spare|drop)\s+'
+    r'(some\s+|a\s+|the\s+|me\s+|more\s+|any\s+)?buzz\b',
+    # "{yellow|blue|green} buzz appreciated/please/etc" — color-prefixed
+    # buzz tiers showing up in begging captions.
+    r'\b(yellow|blue|green)\s+buzz\s+'
+    r'(please|appreciated|welcome|pls|plz|tips?|tipping|thanks)\b',
+    # Hashtag begging.
+    r'#buzz\s*(farm|farming|please|pls|plz|me|tips?|tipping)\b',
+    # "support me/us/this with/via buzz" — the explicit ask.
+    r'\bsupport\s+(me|us|this|the\s+\w+)\s+'
+    r'(with|via|by|using)\s+buzz\b',
+]
+
+
+def compile_begging_patterns(
+    patterns: List[str]
+) -> List[re.Pattern[str]]:
+    """Compile a list of regex strings, dropping any that fail.
+
+    A bad pattern from user config shouldn't crash the whole run —
+    we warn and continue with the patterns that did compile, so the
+    filter still does useful work.
+    """
+    compiled: List[re.Pattern[str]] = []
+    for raw in patterns:
+        try:
+            compiled.append(re.compile(raw, re.IGNORECASE))
+        except re.error as exc:
+            print(
+                f"⚠️  Skipping invalid begging pattern {raw!r}: {exc}"
+            )
+    return compiled
+
+
+def detect_begging_match(
+    image_data: Dict[str, Any],
+    patterns: List[re.Pattern[str]]
+) -> Optional[str]:
+    """Return the source of the first matching pattern, or None.
+
+    Scans the prompt and negative prompt — that's where this stuff
+    overwhelmingly lives, because users tack the beg onto the
+    generation prompt so it travels with the image metadata. Other
+    meta fields are ignored to keep false positives down.
+    """
+    meta = image_data.get("meta")
+    if not isinstance(meta, dict):
+        return None
+
+    haystack_parts: List[str] = []
+    for key in ("prompt", "negativePrompt"):
+        value = meta.get(key)
+        if isinstance(value, str) and value:
+            haystack_parts.append(value)
+
+    if not haystack_parts:
+        return None
+
+    haystack = " \n ".join(haystack_parts)
+    for pattern in patterns:
+        if pattern.search(haystack):
+            return pattern.pattern
+    return None
+
+
 def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
     """Load configuration from YAML file"""
     config_file = Path(config_path)
@@ -660,6 +742,184 @@ class ObsidianPageGenerator:
                 return candidate.name
         return None
 
+    @classmethod
+    def scan_image_ids_in_folder(cls, images_folder: Path) -> set[int]:
+        """Return the set of numeric image IDs present in a folder.
+
+        Image files are named `{id}.{ext}` — we treat the stem as an int
+        and skip anything that doesn't parse, which filters out stray
+        files a user may have dropped into the folder.
+        """
+        if not images_folder.is_dir():
+            return set()
+        ids: set[int] = set()
+        for entry in images_folder.iterdir():
+            if not entry.is_file():
+                continue
+            if entry.suffix.lstrip('.').lower() not in cls._IMAGE_EXTENSIONS:
+                continue
+            try:
+                ids.add(int(entry.stem))
+            except ValueError:
+                continue
+        return ids
+
+    # Embed pattern for image references inside the generated notes.
+    # Allows optional `|alt-text` or `#anchor` suffixes that a user may
+    # have added by hand. The `\.` is a literal dot — not `.\w+`, which
+    # would also match a stray character before the extension.
+    _EMBED_PATTERN = re.compile(
+        r'!\[\[[^\]]*?/(\d+)\.\w+(?:[|#][^\]]*)?\]\]'
+    )
+
+    # Matches a complete YAML frontmatter block at the start of a file:
+    # `---<EOL><body><EOL>---<EOL>`. Handles both LF and CRLF endings.
+    # Group 1 captures the body between the fences.
+    _FRONTMATTER_PATTERN = re.compile(
+        r'\A---\r?\n(.*?)\r?\n---\r?\n', re.DOTALL
+    )
+
+    @classmethod
+    def extract_image_ids_from_markdown(cls, content: str) -> set[int]:
+        """Pull image IDs referenced by `![[...]]` embeds in a note.
+
+        We deliberately union this with the on-disk scan: a user may
+        have deleted an image file but kept its entry in the doc (or
+        vice versa), and either signal means "we've seen this one".
+        """
+        return {int(m) for m in cls._EMBED_PATTERN.findall(content)}
+
+    @classmethod
+    def extract_frontmatter_field(
+        cls,
+        content: str,
+        field: str
+    ) -> Optional[str]:
+        """Return the raw value of `field:` from frontmatter, or None.
+
+        Used to sanity-check that an existing note actually corresponds
+        to the model we're about to update — see the `source:` guard in
+        the update flow. The value is returned stripped, with leading
+        and trailing whitespace removed.
+        """
+        match = cls._FRONTMATTER_PATTERN.match(content)
+        if not match:
+            return None
+        block = match.group(1)
+        field_re = re.compile(
+            rf'^{re.escape(field)}:\s*(.*)$', re.MULTILINE
+        )
+        field_match = field_re.search(block)
+        if not field_match:
+            return None
+        return field_match.group(1).strip()
+
+    @classmethod
+    def upsert_frontmatter_field(
+        cls,
+        content: str,
+        field: str,
+        value: str
+    ) -> str:
+        """Set `field: value` in the YAML frontmatter, adding if needed.
+
+        Assumes the frontmatter is the standard `---`-delimited block at
+        the top of the file. If no frontmatter exists the content is
+        returned unchanged — we don't want to invent one mid-update.
+        The output always uses LF line endings inside the frontmatter
+        and preserves everything after the closing fence byte-for-byte.
+        """
+        match = cls._FRONTMATTER_PATTERN.match(content)
+        if not match:
+            return content
+
+        block = match.group(1)
+        after_block = content[match.end():]
+        replacement = f'{field}: {value}'
+
+        field_pattern = re.compile(
+            rf'^{re.escape(field)}:.*$', re.MULTILINE
+        )
+        if field_pattern.search(block):
+            new_block = field_pattern.sub(
+                lambda _m: replacement, block, count=1
+            )
+        else:
+            # Slot the new field right after `created:` so related date
+            # fields stay grouped. Fall back to appending if no
+            # `created:` line exists.
+            created_pattern = re.compile(r'^(created:.*)$', re.MULTILINE)
+            if created_pattern.search(block):
+                new_block = created_pattern.sub(
+                    lambda m: f'{m.group(1)}\n{replacement}',
+                    block,
+                    count=1
+                )
+            else:
+                new_block = block.rstrip('\r\n') + f'\n{replacement}'
+
+        # Normalize: strip trailing newlines from the block so the
+        # closing fence doesn't end up with a blank line before it.
+        new_block = new_block.rstrip('\r\n')
+        return f'---\n{new_block}\n---\n{after_block}'
+
+    def build_update_section(
+        self,
+        new_images: List[Dict[str, Any]],
+        images_folder: Path,
+        update_date: str
+    ) -> str:
+        """Render the markdown for an update batch of new images.
+
+        Mirrors the layout of `generate_page`'s example-images section
+        so updates look visually identical to the originals, just under
+        a dated heading.
+        """
+        lines: List[str] = []
+        lines.append(f"## Example Images — Update {update_date}\n")
+
+        media_rel = self.config.get("obsidian", {}).get(
+            "media_folder",
+            "zzMedia/Model and Lora Example Images"
+        )
+
+        for idx, image_data in enumerate(new_images, 1):
+            image_id = image_data.get("id", idx)
+            image_filename = self.find_image_filename(
+                images_folder, image_id
+            ) or f"{image_id}.jpeg"
+
+            lines.append(f"#### Image {idx}\n")
+            relative_path = (
+                f"{media_rel}/{images_folder.name}/{image_filename}"
+            )
+            lines.append(f"![[{relative_path}]]\n")
+
+            stats = image_data.get("stats", {})
+            reactions = (
+                stats.get("likeCount", 0) + stats.get("heartCount", 0)
+            )
+            width = image_data.get("width")
+            height = image_data.get("height")
+
+            stats_parts = []
+            if reactions > 0:
+                stats_parts.append(f"{reactions} reactions")
+            if width and height:
+                stats_parts.append(f"{width}×{height}")
+            if stats_parts:
+                lines.append(f"*{' | '.join(stats_parts)}*\n")
+
+            meta = image_data.get("meta")
+            if meta and isinstance(meta, dict):
+                lines.append(self.format_generation_params(meta))
+            else:
+                lines.append("_No generation parameters available_")
+
+            lines.append("\n---\n")
+
+        return "\n".join(lines)
+
     def generate_page(
         self,
         model_data: Dict[str, Any],
@@ -892,12 +1152,54 @@ def main() -> None:
         help="Skip downloading images (useful for testing)"
     )
     parser.add_argument(
+        "--update",
+        action="store_true",
+        help=(
+            "Append newly-fetched images to an existing Obsidian note "
+            "instead of regenerating it. Skips images that are already "
+            "referenced in the note or present in the model's image "
+            "folder, so reruns won't duplicate content."
+        )
+    )
+    parser.add_argument(
+        "--require-meta",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Skip images that lack generation metadata. "
+            "Default: on (use --no-require-meta to keep all images)."
+        )
+    )
+    parser.add_argument(
+        "--filter-begging",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Filter out images whose prompt contains 'buzz please', "
+            "'give me buzz', and similar tip-begging language. "
+            "Default: on (use --no-filter-begging to disable)."
+        )
+    )
+    parser.add_argument(
         "--config",
         default="config.yaml",
         help="Path to config file (default: config.yaml)"
     )
 
     args = parser.parse_args()
+
+    # --skip-download with --update would write entries pointing at
+    # files that aren't on disk, leaving the note full of broken
+    # embeds. Refuse the combo up front so the user can drop one or
+    # the other rather than discover the damage later.
+    if args.update and args.skip_download:
+        print(
+            "❌ --update and --skip-download cannot be combined.\n"
+            "   The update flow only appends images it has actually "
+            "downloaded; with --skip-download every appended embed "
+            "would point at a missing file."
+        )
+        sys.exit(1)
 
     # Load configuration
     config = load_config(args.config)
@@ -926,18 +1228,48 @@ def main() -> None:
         args.limit if args.limit is not None
         else defaults.get("image_limit", 200)
     )
-    sort = (
-        args.sort if args.sort is not None
-        else defaults.get("sort_order", "Most Reactions")
-    )
-    period = (
-        args.period if args.period is not None
-        else defaults.get("time_period", "AllTime")
-    )
+    # In --update mode the whole point is to find images that weren't
+    # available the last time we ran, so default to Newest/Month if the
+    # user didn't pin an explicit sort. Config defaults still apply for
+    # normal runs.
+    if args.update:
+        sort = args.sort if args.sort is not None else "Newest"
+        period = args.period if args.period is not None else "Month"
+    else:
+        sort = (
+            args.sort if args.sort is not None
+            else defaults.get("sort_order", "Most Reactions")
+        )
+        period = (
+            args.period if args.period is not None
+            else defaults.get("time_period", "AllTime")
+        )
     nsfw_arg = (
         args.nsfw if args.nsfw is not None
         else defaults.get("nsfw_filter", "all")
     )
+
+    # Quality filters. Default both on — the typical use case is
+    # building a curated reference library, and the failure mode for
+    # "ship it broken" (a vault full of meta-less duds or buzz spam)
+    # is more annoying to clean up than re-running with --no-...
+    require_meta = (
+        args.require_meta if args.require_meta is not None
+        else defaults.get("require_meta", True)
+    )
+    filter_begging = (
+        args.filter_begging if args.filter_begging is not None
+        else defaults.get("filter_begging", True)
+    )
+
+    # Compile begging patterns once, up front. Built-in patterns plus
+    # whatever the user has added under `defaults.begging_patterns_extra`.
+    begging_patterns: List[re.Pattern[str]] = []
+    if filter_begging:
+        pattern_strings = list(DEFAULT_BEGGING_PATTERNS) + list(
+            defaults.get("begging_patterns_extra", []) or []
+        )
+        begging_patterns = compile_begging_patterns(pattern_strings)
 
     # Initialize
     civitai_config = config.get("civitai", {})
@@ -977,6 +1309,119 @@ def main() -> None:
             nsfw_param = False
         # "all" leaves it as None (no filter)
 
+        # Compute target note path up front. In --update mode we need
+        # to read the existing file before fetching, so we always
+        # resolve the path here regardless of mode.
+        formatted_title = generator.format_title(
+            model_data,
+            model_version_id
+        )
+        page_filename = f"{formatted_title}.md"
+        note_dir = generator.get_note_directory(
+            model_data, model_version_id
+        )
+        note_path = note_dir / page_filename
+
+        folder_name = ObsidianPageGenerator.build_image_folder_name(
+            model_data, model_version_id
+        )
+        images_folder = generator.media_folder / folder_name
+
+        # In update mode, refuse to run without a pre-existing note —
+        # otherwise the user almost certainly meant a normal run and
+        # would be surprised by a fresh-looking doc with only a few
+        # "Update YYYY-MM-DD" images and no original batch above them.
+        existing_content: Optional[str] = None
+        known_ids: set[int] = set()
+        if args.update:
+            # Pre-flight checks. Both the note and the image folder
+            # must already exist; bail out with a precise diagnostic if
+            # either is missing so the user knows which side to fix.
+            problems: List[str] = []
+            if not note_path.exists():
+                problems.append(
+                    f"Obsidian note not found at:\n      {note_path}"
+                )
+            elif not note_path.is_file():
+                problems.append(
+                    f"Path exists but is not a regular file:\n"
+                    f"      {note_path}"
+                )
+            if not images_folder.exists():
+                problems.append(
+                    f"Image folder not found at:\n      "
+                    f"{images_folder}"
+                )
+            elif not images_folder.is_dir():
+                problems.append(
+                    f"Image folder path exists but is not a "
+                    f"directory:\n      {images_folder}"
+                )
+
+            if problems:
+                print(
+                    "\n❌ --update pre-flight checks failed. The "
+                    "following must exist before an update can run:"
+                )
+                for p in problems:
+                    print(f"   • {p}")
+                print(
+                    "\n   Run without --update to perform a fresh "
+                    "fetch, or verify the model name / version ID "
+                    "matches what was used originally."
+                )
+                sys.exit(1)
+
+            existing_content = note_path.read_text(encoding='utf-8')
+
+            # Verify the note we found actually corresponds to this
+            # model. Two different models can produce the same title
+            # (e.g. both LoRAs named "Style Test" on SDXL), and we'd
+            # otherwise dedupe against — and append to — the wrong
+            # note. The `source:` line in our generated frontmatter is
+            # the authoritative pointer back to the CivitAI model.
+            existing_source = (
+                ObsidianPageGenerator.extract_frontmatter_field(
+                    existing_content, 'source'
+                )
+            )
+            expected_source = (
+                f"https://civitai.com/models/{model_id}"
+            )
+            if existing_source is None:
+                print(
+                    "\n⚠️  Existing note has no `source:` field in its "
+                    "frontmatter — skipping model-match verification. "
+                    "If this note wasn't generated by this script, "
+                    "double-check the path is right before proceeding."
+                )
+            elif existing_source.rstrip('/') != expected_source:
+                print(
+                    "\n❌ The existing note at this path belongs to a "
+                    "different model.\n"
+                    f"   Expected source: {expected_source}\n"
+                    f"   Note's source:   {existing_source}\n"
+                    "   Refusing to update — appending here would "
+                    "corrupt that other note."
+                )
+                sys.exit(1)
+
+            md_ids = (
+                ObsidianPageGenerator.extract_image_ids_from_markdown(
+                    existing_content
+                )
+            )
+            disk_ids = (
+                ObsidianPageGenerator.scan_image_ids_in_folder(
+                    images_folder
+                )
+            )
+            known_ids = md_ids | disk_ids
+            print(
+                f"\n🔁 Update mode: found {len(md_ids)} images in note "
+                f"and {len(disk_ids)} on disk ({len(known_ids)} unique)"
+            )
+
         # Fetch images
         print(f"📊 Sort order: {sort}")
         print(f"📅 Period: {period}")
@@ -991,21 +1436,98 @@ def main() -> None:
             api_delay=api_delay
         )
 
-        # Filter out images without metadata if user wants quality data
-        images_with_meta = [
-            img for img in images_data if img.get('meta')
-        ]
-        print(
-            f"\n✅ Fetched {len(images_data)} images "
-            f"({len(images_with_meta)} with generation metadata)"
-        )
+        api_count = len(images_data)
+        print(f"\n✅ Fetched {api_count} image(s) from API")
+
+        # Quality filters are applied in priority order: first drop
+        # already-processed images (cheapest, update-mode only), then
+        # require generation metadata (needed for downstream checks),
+        # then run the begging filter (most expensive — regex per
+        # prompt). Reporting is consolidated at the bottom so the user
+        # sees a single coherent funnel.
+        dropped_known = 0
+        if args.update:
+            before = len(images_data)
+            images_data = [
+                img for img in images_data
+                if img.get("id") not in known_ids
+            ]
+            dropped_known = before - len(images_data)
+
+        dropped_meta = 0
+        if require_meta:
+            before = len(images_data)
+            images_data = [
+                img for img in images_data if img.get('meta')
+            ]
+            dropped_meta = before - len(images_data)
+
+        dropped_begging = 0
+        begging_samples: List[str] = []
+        if filter_begging and begging_patterns:
+            kept: List[Dict[str, Any]] = []
+            for img in images_data:
+                matched = detect_begging_match(img, begging_patterns)
+                if matched is None:
+                    kept.append(img)
+                    continue
+                dropped_begging += 1
+                # Stash a short, human-readable sample for the summary
+                # so the user can verify the filter is doing the right
+                # thing without scrolling through a wall of output.
+                if len(begging_samples) < 5:
+                    prompt = (img.get('meta') or {}).get('prompt') or ''
+                    excerpt = prompt.strip().replace('\n', ' ')
+                    if len(excerpt) > 80:
+                        excerpt = excerpt[:77] + '...'
+                    begging_samples.append(
+                        f"      {img.get('id')}: {excerpt!r}"
+                    )
+            images_data = kept
+
+        # Funnel summary — only print the lines that actually fired so
+        # the output stays tight when filters didn't drop anything.
+        if dropped_known:
+            print(
+                f"   → dropped {dropped_known} already in note/folder"
+            )
+        if dropped_meta:
+            print(
+                f"   → dropped {dropped_meta} without generation "
+                f"metadata"
+            )
+        if dropped_begging:
+            print(
+                f"   → dropped {dropped_begging} matching the "
+                f"begging-spam filter"
+            )
+            for sample in begging_samples:
+                print(sample)
+            if dropped_begging > len(begging_samples):
+                print(
+                    f"      ... and "
+                    f"{dropped_begging - len(begging_samples)} more"
+                )
+        print(f"   → {len(images_data)} image(s) will be processed")
+
+        if not images_data:
+            if args.update:
+                print(
+                    "\n✨ Nothing new to add after filters. The "
+                    "existing note is unchanged. Try widening the "
+                    "search with --sort Newest --period AllTime, "
+                    "raising --limit, or relaxing the filters."
+                )
+            else:
+                print(
+                    "\n✨ Nothing left after filters. Try --no-require"
+                    "-meta or --no-filter-begging to broaden the set, "
+                    "or raise --limit."
+                )
+            return
 
         # Create folder for images, named after the model so the user
         # can tell what's in each folder when browsing the vault.
-        folder_name = ObsidianPageGenerator.build_image_folder_name(
-            model_data, model_version_id
-        )
-        images_folder = generator.media_folder / folder_name
         images_folder.mkdir(parents=True, exist_ok=True)
         print(f"📁 Images will be saved to: {images_folder}")
 
@@ -1048,37 +1570,118 @@ def main() -> None:
                 f"\n✅ Downloaded {downloaded}/{len(images_data)} images"
             )
 
-        # Generate Obsidian page
-        print("\n📝 Generating Obsidian page...")
-        page_content = generator.generate_page(
-            model_data=model_data,
-            images_data=images_data,
-            images_folder=images_folder,
-            model_name=model_name,
-            specific_version_id=model_version_id
-        )
+        if args.update and existing_content is not None:
+            # Drop any image we tried to download but failed to land on
+            # disk — otherwise the appended section would have `![[...]]`
+            # entries pointing at files that aren't there. Re-scanning
+            # the folder is the source of truth: if the file exists,
+            # the embed will resolve; if it doesn't, the embed is dead.
+            final_disk_ids = (
+                ObsidianPageGenerator.scan_image_ids_in_folder(
+                    images_folder
+                )
+            )
+            before_drop = len(images_data)
+            images_data = [
+                img for img in images_data
+                if img.get("id") in final_disk_ids
+            ]
+            dropped = before_drop - len(images_data)
+            if dropped:
+                print(
+                    f"⚠️  Dropped {dropped} image(s) that failed to "
+                    f"download — they will not be added to the note."
+                )
 
-        # Save page with formatted title
-        formatted_title = generator.format_title(
-            model_data,
-            model_version_id
-        )
-        page_filename = f"{formatted_title}.md"
-        generator.save_page(
-            page_content,
-            page_filename,
-            model_data,
-            model_version_id
-        )
+            if not images_data:
+                print(
+                    "\n⚠️  No new images were successfully downloaded; "
+                    "the note will not be modified."
+                )
+                return
 
-        print(
-            "\n🎉 Done! You can now open the page in Obsidian and "
-            "delete any images you don't want."
-        )
-        print(
-            f"   Then just delete the corresponding image files from: "
-            f"{images_folder}"
-        )
+            # Append a dated update section to the existing note rather
+            # than regenerating it from scratch.
+            from datetime import datetime
+
+            update_date = datetime.now().strftime('%Y-%m-%d')
+            print(
+                f"\n📝 Appending update section dated {update_date}..."
+            )
+            update_section = generator.build_update_section(
+                new_images=images_data,
+                images_folder=images_folder,
+                update_date=update_date
+            )
+
+            refreshed = ObsidianPageGenerator.upsert_frontmatter_field(
+                existing_content, 'updated', update_date
+            )
+            # Separator between original body and the appended batch so
+            # the new heading reads cleanly in Obsidian.
+            joiner = (
+                '' if refreshed.endswith('\n\n')
+                else ('\n' if refreshed.endswith('\n') else '\n\n')
+            )
+            merged = refreshed + joiner + update_section
+
+            # Atomic write: stage the merged content in a sibling tmp
+            # file, fsync it, then rename over the original. This way
+            # a crash mid-write never leaves the user's curated note
+            # truncated or partially written. `Path.replace` is atomic
+            # on POSIX and overwrites on Windows.
+            import os
+            tmp_path = note_path.with_name(
+                f".{note_path.name}.update.tmp"
+            )
+            try:
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    f.write(merged)
+                    f.flush()
+                    os.fsync(f.fileno())
+                tmp_path.replace(note_path)
+            except Exception:
+                # Best-effort cleanup so we don't leave a stray tmp
+                # behind for the user to wonder about.
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                raise
+
+            print(f"✅ Appended {len(images_data)} new image(s) to:")
+            print(f"   {note_path}")
+            print(
+                "\n🎉 Done! Open the page in Obsidian to review the new "
+                "images at the bottom."
+            )
+        else:
+            # Generate Obsidian page
+            print("\n📝 Generating Obsidian page...")
+            page_content = generator.generate_page(
+                model_data=model_data,
+                images_data=images_data,
+                images_folder=images_folder,
+                model_name=model_name,
+                specific_version_id=model_version_id
+            )
+
+            generator.save_page(
+                page_content,
+                page_filename,
+                model_data,
+                model_version_id
+            )
+
+            print(
+                "\n🎉 Done! You can now open the page in Obsidian and "
+                "delete any images you don't want."
+            )
+            print(
+                f"   Then just delete the corresponding image files "
+                f"from: {images_folder}"
+            )
 
     except Exception as e:
         print(f"\n❌ Error: {e}", file=sys.stderr)
