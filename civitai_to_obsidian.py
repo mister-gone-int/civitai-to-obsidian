@@ -18,16 +18,39 @@ By: Kevin Neblett
 """
 
 import argparse
+import json
+import os
 import re
+import shutil
+import struct
 import sys
 import time
+import zlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import yaml
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# Pillow + piexif power the metadata embedding helpers below. Both are
+# declared in requirements.txt — import errors here mean the user is
+# running an out-of-date environment and should `pip install -r
+# requirements.txt`. We surface that clearly rather than crashing deep
+# inside an embed call.
+try:
+    from PIL import Image, UnidentifiedImageError
+    import piexif
+    import piexif.helper
+except ImportError as _imerr:  # pragma: no cover — install-state check
+    print(
+        "❌ Missing image-handling dependency:",
+        _imerr,
+        "\n   Run: pip install -r requirements.txt",
+        file=sys.stderr,
+    )
+    raise
 
 # Interactive mode is opt-in via --interactive; keep the import soft so a
 # user who never touches that flag doesn't need questionary installed.
@@ -160,6 +183,1145 @@ def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
 
     with open(config_file, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
+
+
+# ---------------------------------------------------------------------
+# Generation-metadata embedding
+#
+# The download pipeline writes the raw bytes that CivitAI's CDN serves.
+# Sometimes those bytes lack the embedded generation parameters even
+# when the API has them — most often because the CDN-served file was
+# re-encoded server-side without copying the EXIF/tEXt across. The
+# helpers below let us:
+#
+#   1. Render CivitAI's `meta` dict to the standard A1111 "parameters"
+#      string that A1111 / Forge / ComfyUI / Civitai's own viewer read.
+#   2. Read whatever generation params are already embedded.
+#   3. Merge the two non-destructively (file always wins on conflict;
+#      API only fills gaps).
+#   4. Write the merged string back into the file using the LEAST
+#      invasive mechanism for that format:
+#        - PNG  → manual tEXt chunk surgery (pixel data never decoded)
+#        - JPEG → piexif.insert (only the EXIF APP1 segment changes;
+#                 the compressed image data is byte-for-byte identical)
+#        - WEBP → skipped (safe in-place EXIF patching needs raw RIFF
+#                 chunk manipulation; deferred — see backfill script)
+#
+# Every write goes through a tempfile + verify + atomic rename, so a
+# crash or assertion failure mid-write never leaves a damaged file.
+# ---------------------------------------------------------------------
+
+# Civitai's meta uses a mix of camelCase (prompt, negativePrompt,
+# steps, sampler, cfgScale, seed, clipSkip, denoise, scheduler,
+# resources, civitaiResources) and A1111-style Title Case (Model,
+# Model hash, Clip skip, Size, Denoising strength, Hires upscale,
+# Schedule type, Version, VAE). The canonical form for the A1111
+# "parameters" string is Title Case, so we translate camelCase keys
+# on the way in. Anything not in this map is passed through unchanged
+# — that covers Civitai's already-Title-Case keys plus any forward-
+# compat additions (aspectRatio, baseModel, models, vaes, upscalers,
+# extra, hashes, workflow, process, etc.).
+#
+# The entries here are MANDATORY for non-duplication: without them,
+# a file with `Clip skip: 2` and an API response with `clipSkip: 2`
+# would merge into a file that has BOTH keys — exactly the duplication
+# we're meant to prevent.
+_CIVITAI_TO_A1111: Dict[str, str] = {
+    # Standard A1111 prompt/param synonyms
+    "negativePrompt": "Negative prompt",
+    "steps": "Steps",
+    "sampler": "Sampler",
+    "cfgScale": "CFG scale",
+    "seed": "Seed",
+    "clipSkip": "Clip skip",
+    "denoise": "Denoising strength",
+    "scheduler": "Schedule type",
+    # Resource lists — older (`resources`: {name, hash, type}) and
+    # newer (`civitaiResources`: {type, modelVersionId, weight})
+    # both collapse to the single `Civitai resources` key that
+    # Civitai's own writer uses in the PNG `parameters` string.
+    # An image typically has only one of the two, so this won't
+    # collide within a single response.
+    "resources": "Civitai resources",
+    "civitaiResources": "Civitai resources",
+}
+
+# Keys we deliberately never write into the parameters string.
+#   - `comfy`: full ComfyUI workflow JSON dump (kilobytes of nested
+#     structure). ComfyUI carries it in its own `workflow` PNG chunk;
+#     putting it on the A1111 params line bloats files and breaks
+#     params-line parsers in some readers.
+#   - `width`/`height`: redundant with `Size: WIDTHxHEIGHT`. We
+#     synthesize Size from them during normalization and drop them.
+#   - `prompt`/`Negative prompt`: special-cased into their own lines
+#     by the formatter, not the params line.
+_PARAMS_SKIP_KEYS = {
+    "prompt", "negativePrompt", "Negative prompt",
+    "comfy",
+    "width", "height",
+}
+
+# Order that A1111/Forge emit known params in. Anything not listed
+# here is appended in whatever order it appears in the source dict.
+# `Lora hashes` is on the list so when we synthesize it we slot it
+# in the canonical A1111 position rather than appending at the end.
+_A1111_STANDARD_ORDER: List[str] = [
+    "Steps", "Sampler", "Schedule type", "CFG scale", "Seed", "Size",
+    "Model hash", "Model", "VAE", "Denoising strength", "Clip skip",
+    "Hires upscale", "Hires upscaler", "Hires steps", "Lora hashes",
+    "Version",
+]
+
+
+def _normalize_meta(meta: Any) -> Dict[str, Any]:
+    """Convert a Civitai meta dict (or any A1111-keyed dict) to the
+    canonical Title-Case form used internally.
+
+    Steps:
+      1. Translate known camelCase synonyms (clipSkip → Clip skip,
+         resources → Civitai resources, etc.) via _CIVITAI_TO_A1111.
+      2. Drop empty values (None / blank strings) — they carry no
+         information and would just add noise to the merge.
+      3. Drop _PARAMS_SKIP_KEYS that aren't relevant (comfy workflow
+         dump, redundant width/height).
+      4. Synthesize `Size: WIDTHxHEIGHT` from `width`+`height` when
+         present and `Size` isn't — A1111-style readers expect Size,
+         and carrying width/height separately is a duplicate
+         representation of the same fact.
+    """
+    if not isinstance(meta, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for k, v in meta.items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        # Translate camelCase → A1111 canonical Title Case.
+        norm_k = _CIVITAI_TO_A1111.get(k, k)
+        # Skip ComfyUI workflow dump and the width/height keys we'll
+        # synthesize below; keep prompt / Negative prompt so the
+        # formatter can emit them as their own lines.
+        if norm_k in _PARAMS_SKIP_KEYS - {"prompt", "Negative prompt"}:
+            continue
+        out[norm_k] = v
+
+    # Synthesize Size from width+height. We read these from the raw
+    # input (they were skipped above) so a caller passing only
+    # width/height still gets a usable Size. Only fills the slot
+    # when Size isn't already present — file-side Size always wins.
+    if "Size" not in out:
+        w = meta.get("width")
+        h = meta.get("height")
+        if (
+            isinstance(w, (int, float, str))
+            and isinstance(h, (int, float, str))
+            and str(w).strip()
+            and str(h).strip()
+        ):
+            # Normalize numeric strings: 832.0 → "832", "832" → "832"
+            def _intify(x: Any) -> str:
+                try:
+                    n = float(x)
+                    if n == int(n):
+                        return str(int(n))
+                except (TypeError, ValueError):
+                    pass
+                return str(x).strip()
+            out["Size"] = f"{_intify(w)}x{_intify(h)}"
+
+    return out
+
+
+def _format_param_value(v: Any) -> str:
+    """Render a value for the comma-separated params line.
+
+    - dicts and lists → JSON-encoded (compact). Civitai's own writer
+      does this for `Civitai resources` and `Civitai metadata`. Our
+      bracket-aware parser round-trips JSON losslessly without
+      needing quotes, and that matches the wire format SagaSigil /
+      A1111 / Forge expect.
+    - bracketed strings → emitted bare (caller already JSON-encoded,
+      or read a JSON value back through parse_a1111_params).
+    - strings with commas → wrapped in double quotes so the params-
+      line splitter doesn't mis-split them. Embedded quotes escaped.
+    - everything else → str() unchanged.
+
+    None values should be filtered upstream by _normalize_meta; if
+    one slips through here it becomes the literal text "None" rather
+    than silently dropping the field, which is loud enough to notice.
+    """
+    if isinstance(v, (list, dict)):
+        return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+    s = str(v)
+    if s.startswith("[") or s.startswith("{"):
+        return s
+    if "," in s and not (s.startswith('"') and s.endswith('"')):
+        return '"' + s.replace('"', '\\"') + '"'
+    return s
+
+
+def _quote_aware_split(text: str, sep: str = ",") -> List[str]:
+    """Split on sep but treat double-quoted spans AND bracketed spans
+    as opaque.
+
+    Real-world A1111 params lines contain values like
+    `Civitai resources: [{"modelName": "X", "weight": 1.0}]` where the
+    commas inside the JSON-like structure are NOT separators. We track
+    nesting depth for `[`/`]` and `{`/`}` (in addition to `"..."`) and
+    only split on `sep` when we're at depth zero outside any quote.
+
+    Escaped quotes (\\") inside a quoted span are preserved as part of
+    the span.
+    """
+    parts: List[str] = []
+    buf: List[str] = []
+    in_quote = False
+    bracket_depth = 0  # square brackets
+    brace_depth = 0    # curly braces
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] == '"':
+            buf.append(text[i:i + 2])
+            i += 2
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+            buf.append(ch)
+        elif not in_quote and ch == "[":
+            bracket_depth += 1
+            buf.append(ch)
+        elif not in_quote and ch == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+            buf.append(ch)
+        elif not in_quote and ch == "{":
+            brace_depth += 1
+            buf.append(ch)
+        elif not in_quote and ch == "}":
+            brace_depth = max(0, brace_depth - 1)
+            buf.append(ch)
+        elif (
+            ch == sep and not in_quote
+            and bracket_depth == 0 and brace_depth == 0
+        ):
+            parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    if buf:
+        parts.append("".join(buf).strip())
+    return [p for p in parts if p]
+
+
+def format_a1111_params(meta: Dict[str, Any]) -> str:
+    """Render a meta dict to the standard A1111 'parameters' string.
+
+    Output shape:
+        <prompt>
+        Negative prompt: <negative>
+        Steps: 30, Sampler: Euler a, CFG scale: 7, Seed: 12345, ...
+
+    Returns '' when there's nothing useful to write (no prompt, no
+    params).
+    """
+    canon = _normalize_meta(meta)
+    if not canon:
+        return ""
+
+    lines: List[str] = []
+
+    prompt = canon.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        lines.append(prompt.strip())
+
+    neg = canon.get("Negative prompt")
+    if isinstance(neg, str) and neg.strip():
+        lines.append(f"Negative prompt: {neg.strip()}")
+
+    param_pairs: List[str] = []
+    seen: set[str] = set()
+    for key in _A1111_STANDARD_ORDER:
+        if key in canon and key not in _PARAMS_SKIP_KEYS:
+            v = canon[key]
+            param_pairs.append(f"{key}: {_format_param_value(v)}")
+            seen.add(key)
+    for key, value in canon.items():
+        if key in seen or key in _PARAMS_SKIP_KEYS:
+            continue
+        param_pairs.append(f"{key}: {_format_param_value(value)}")
+        seen.add(key)
+
+    if param_pairs:
+        lines.append(", ".join(param_pairs))
+
+    # An A1111 string is empty if there's literally nothing to record;
+    # don't write a chunk just to embed whitespace.
+    return "\n".join(lines).strip()
+
+
+def parse_a1111_params(text: str) -> Dict[str, Any]:
+    """Parse an A1111 'parameters' string back into a canonical dict.
+
+    Mirror of format_a1111_params: keys returned use Title-Case form
+    (Steps, Sampler, CFG scale, Seed, Size, Model, Model hash, ...)
+    plus 'prompt' and 'Negative prompt' for the prose fields.
+
+    The parser is forgiving — it accepts multi-line prompts, an absent
+    negative prompt, an absent params line, and quoted values
+    containing commas. Anything truly unparseable produces a partial
+    dict rather than raising, because giving up entirely would mean
+    overwriting potentially-fine file data.
+    """
+    if not text or not text.strip():
+        return {}
+
+    text = text.replace("\r\n", "\n").strip()
+    lines = text.split("\n")
+
+    # Anchor: the params line is the LAST line that looks like a
+    # key:value, key:value, ... list. We scan backwards because A1111
+    # always puts the params line at the bottom, and prompts can
+    # legitimately contain text like "Steps: how to use them" that
+    # would falsely match a forward scan.
+    def _is_params_line(line: str) -> bool:
+        # Strong anchor: "Steps: " followed by a digit is what A1111
+        # always emits at the start of its params line.
+        if re.match(r"^Steps:\s+\d", line):
+            return True
+        # Weaker fallback for files where Steps was stripped or
+        # renamed: at least two `Key: value` pairs separated by a
+        # comma. Requires a Title-Case key to avoid matching prose.
+        if re.match(r"^[A-Z][A-Za-z0-9 _\-]*:\s", line):
+            return line.count(": ") >= 2 and "," in line
+        return False
+
+    params_idx: Optional[int] = None
+    for i in range(len(lines) - 1, -1, -1):
+        if _is_params_line(lines[i]):
+            params_idx = i
+            break
+
+    result: Dict[str, Any] = {}
+
+    # Find the negative prompt start, if any. A1111 always puts it
+    # between prompt and params.
+    neg_idx: Optional[int] = None
+    scan_end = params_idx if params_idx is not None else len(lines)
+    for i in range(scan_end):
+        if lines[i].startswith("Negative prompt: "):
+            neg_idx = i
+            break
+
+    # Slice out prompt / negative / params sections.
+    if neg_idx is not None:
+        prompt_lines = lines[:neg_idx]
+        neg_lines = (
+            [lines[neg_idx][len("Negative prompt: "):]]
+            + lines[neg_idx + 1:scan_end]
+        )
+    else:
+        prompt_lines = lines[:scan_end]
+        neg_lines = []
+
+    prompt = "\n".join(prompt_lines).strip()
+    neg = "\n".join(neg_lines).strip()
+    if prompt:
+        result["prompt"] = prompt
+    if neg:
+        result["Negative prompt"] = neg
+
+    if params_idx is not None:
+        params_text = " ".join(lines[params_idx:])
+        for part in _quote_aware_split(params_text, ","):
+            if ":" not in part:
+                continue
+            k, _, v = part.partition(":")
+            k = k.strip()
+            v = v.strip()
+            # Unwrap quoted values, restoring any escaped quotes.
+            if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+                v = v[1:-1].replace('\\"', '"')
+            if k:
+                result[k] = v
+
+    return result
+
+
+class MergeResult(NamedTuple):
+    """Outcome of a non-destructive metadata merge.
+
+    - `merged` — the union dict that will be re-formatted into the
+      file's parameters string.
+    - `added_keys` — keys the API contributed that the file didn't
+      already have. Drives the dry-run report.
+    - `changed` — convenience bool: True iff any rewrite is needed.
+    - `notes` — human-readable list of special operations the merge
+      performed beyond a plain gap-fill (JSON-prompt rescue, Lora
+      hashes synthesis). Surfaced in the report so the user can see
+      every non-trivial decision the merger made.
+    """
+    merged: Dict[str, Any]
+    added_keys: List[str]
+    changed: bool
+    notes: List[str]
+
+
+def _looks_like_json_dump(s: Any) -> bool:
+    """True if `s` is a string whose first non-whitespace character
+    starts a JSON object/array AND it actually parses as JSON.
+
+    Real text prompts effectively never start with `{` or `[` and
+    will almost never parse as JSON, so this is a strong signal
+    that the field is misfiled workflow data rather than a prompt.
+    We require BOTH conditions so a prompt that happens to start
+    with `[masterpiece, ...]` (rare but possible) doesn't trigger.
+    """
+    if not isinstance(s, str):
+        return False
+    stripped = s.lstrip()
+    if not stripped or stripped[0] not in "{[":
+        return False
+    try:
+        json.loads(stripped)
+        return True
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+
+def _synthesize_lora_hashes(meta: Dict[str, Any]) -> Optional[str]:
+    """Build the A1111-standard `Lora hashes` value from a merged
+    meta dict, or return None when there's nothing to synthesize.
+
+    The standard format is a comma-separated `name: hash` list:
+        Lora hashes: "name1: hash1, name2: hash2"
+
+    Two data sources are tried in order:
+      1. `Civitai resources` — older Civitai PNG/API format,
+         `[{name, hash, type}]`. Walks the list for type=="lora"
+         entries with both name and hash present.
+      2. `hashes` — Civitai API dict like
+         `{"model": "...", "lora:Some LoRA": "abc123"}`. We pull
+         keys starting with `lora:` and use the trailing portion
+         as the LoRA name.
+
+    Civitai's `civitaiResources` format has weight+modelVersionId
+    but no hash, so it can't be used here — that information is
+    still preserved in the `Civitai resources` JSON value verbatim.
+    """
+    pairs: List[Tuple[str, str]] = []
+    seen: set[str] = set()
+
+    res = meta.get("Civitai resources")
+    if isinstance(res, str):
+        # We may be looking at a value that came through the parser
+        # as a JSON-encoded string. Try to inflate; if it doesn't
+        # parse, just skip — Lora hashes is opportunistic.
+        try:
+            res = json.loads(res)
+        except (json.JSONDecodeError, ValueError):
+            res = None
+    if isinstance(res, list):
+        for r in res:
+            if not isinstance(r, dict):
+                continue
+            if r.get("type") != "lora":
+                continue
+            name = r.get("name")
+            h = r.get("hash")
+            if name and h and name not in seen:
+                pairs.append((str(name), str(h)))
+                seen.add(name)
+
+    hashes = meta.get("hashes")
+    if isinstance(hashes, str):
+        try:
+            hashes = json.loads(hashes)
+        except (json.JSONDecodeError, ValueError):
+            hashes = None
+    if isinstance(hashes, dict):
+        for k, v in hashes.items():
+            if not isinstance(k, str) or not k.startswith("lora:"):
+                continue
+            name = k[len("lora:"):]
+            if name and v and name not in seen:
+                pairs.append((name, str(v)))
+                seen.add(name)
+
+    if not pairs:
+        return None
+    return ", ".join(f"{n}: {h}" for n, h in pairs)
+
+
+def merge_meta_nondestructive(
+    file_meta: Dict[str, Any],
+    api_meta: Dict[str, Any]
+) -> MergeResult:
+    """Merge api_meta into file_meta without overwriting any field
+    that already has a non-empty value in file_meta.
+
+    Core contract: file data is ground truth. API values fill only
+    the keys the file is missing (or has stored as an empty string).
+
+    Two policy exceptions extend this contract:
+
+      1. JSON-prompt rescue. Some Civitai on-site generations file
+         their workflow JSON into the `prompt` field, leaving the
+         actual readable prompt unstored. When the FILE's prompt
+         parses as JSON and the API has a real prompt, we move the
+         JSON to `Civitai source prompt` (preserving it for the
+         user's reference) and let the API's prompt take the
+         `prompt` slot. The rescue is reported in `notes` so the
+         operation is never silent.
+
+      2. Lora hashes synthesis. A1111-style readers key off the
+         `Lora hashes` field for LoRA reproducibility. When the
+         file is missing it but the merged data has Civitai
+         resources / hashes containing LoRA hashes, we synthesize
+         the standard `name: hash, ...` value.
+    """
+    file_canon = _normalize_meta(file_meta)
+    api_canon = _normalize_meta(api_meta)
+
+    notes: List[str] = []
+
+    # --- JSON-prompt rescue (only override of "file wins") ---
+    file_prompt = file_canon.get("prompt")
+    api_prompt = api_canon.get("prompt")
+    if (
+        _looks_like_json_dump(file_prompt)
+        and isinstance(api_prompt, str)
+        and api_prompt.strip()
+        and not _looks_like_json_dump(api_prompt)
+    ):
+        # Stash the JSON content in a dedicated side field so the
+        # original data is preserved verbatim and discoverable — and
+        # so the round-trip safety check can confirm it wasn't lost.
+        # Refuse to clobber an existing side field (extremely
+        # unlikely but cheap to guard against).
+        if "Civitai source prompt" not in file_canon:
+            file_canon["Civitai source prompt"] = file_prompt
+        # Remove the JSON from the prompt slot so the gap-fill loop
+        # below treats prompt as missing and pulls from the API.
+        del file_canon["prompt"]
+        notes.append(
+            "rescued JSON-shaped prompt → moved to "
+            "'Civitai source prompt'; API prompt used instead"
+        )
+
+    # --- Standard non-destructive gap fill ---
+    merged = dict(file_canon)
+    added: List[str] = []
+    for k, v in api_canon.items():
+        existing = merged.get(k)
+        if existing is None or (
+            isinstance(existing, str) and not existing.strip()
+        ):
+            merged[k] = v
+            added.append(k)
+
+    # `Civitai source prompt` is technically a file-side addition,
+    # not an API contribution, but the dry-run report should still
+    # show it as a change so the user sees what happened.
+    if (
+        "Civitai source prompt" in merged
+        and "Civitai source prompt" not in added
+        and "Civitai source prompt" not in file_meta
+    ):
+        added.append("Civitai source prompt")
+
+    # --- Lora hashes synthesis ---
+    if "Lora hashes" not in merged:
+        synth = _synthesize_lora_hashes(merged)
+        if synth:
+            merged["Lora hashes"] = synth
+            added.append("Lora hashes")
+            notes.append(
+                "synthesized A1111-standard 'Lora hashes' from "
+                "Civitai resources / hashes data"
+            )
+
+    return MergeResult(
+        merged=merged,
+        added_keys=added,
+        changed=bool(added),
+        notes=notes,
+    )
+
+
+# --- Low-level format detection / readers ---------------------------
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _detect_image_format(head: bytes) -> Optional[str]:
+    """Return 'png', 'jpeg', 'webp', or None — based on magic bytes.
+
+    Extension-based detection is unreliable for CivitAI downloads (we
+    already sniff during download for that reason), so the embed path
+    re-sniffs here rather than trusting `path.suffix`.
+    """
+    if head.startswith(_PNG_SIGNATURE):
+        return "png"
+    if head[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _iter_png_chunks(data: bytes):
+    """Yield (offset, length, type_bytes, data, crc_bytes) for each
+    chunk in a PNG byte stream. Caller is responsible for the leading
+    8-byte signature being present.
+    """
+    pos = len(_PNG_SIGNATURE)
+    while pos < len(data):
+        if pos + 8 > len(data):
+            return
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        ctype = data[pos + 4:pos + 8]
+        chunk_data = data[pos + 8:pos + 8 + length]
+        crc = data[pos + 8 + length:pos + 12 + length]
+        yield pos, length, ctype, chunk_data, crc
+        pos += 12 + length
+
+
+def _build_text_chunk(keyword: str, text: str) -> bytes:
+    """Build a PNG text chunk (tEXt or iTXt) for `keyword=text`.
+
+    Picks the right chunk type for the content:
+      - tEXt with ISO-8859-1 bytes when the text fits in latin-1.
+        Matches the PNG spec, which says tEXt MUST be latin-1, and is
+        what A1111 / Civitai / Forge produce for ASCII prompts.
+      - iTXt with UTF-8 bytes (uncompressed) when the text contains
+        any non-latin1 character. This is the spec-defined unicode
+        carrier in PNG and is what Pillow's PngInfo.add_text falls
+        back to for unicode strings — it's universally readable by
+        downstream SD tooling.
+
+    Using tEXt with UTF-8 bytes (an older non-conformant convention)
+    would round-trip wrong through PIL: PIL decodes tEXt as latin-1,
+    producing mojibake for unicode prompts on read. We avoid that
+    failure mode entirely by choosing the right chunk type up front.
+    """
+    kw_bytes = keyword.encode("latin-1", errors="replace")
+    try:
+        text_bytes = text.encode("latin-1")
+        chunk_data = kw_bytes + b"\x00" + text_bytes
+        ctype = b"tEXt"
+    except UnicodeEncodeError:
+        # iTXt layout per the PNG spec:
+        #   keyword \0 comp_flag(1) comp_method(1) lang \0
+        #   translated_keyword \0 text
+        # We emit uncompressed (comp_flag=0) with empty language and
+        # translated-keyword fields; readers handle this consistently.
+        text_bytes = text.encode("utf-8")
+        chunk_data = (
+            kw_bytes
+            + b"\x00"        # keyword terminator
+            + b"\x00"        # compression flag (0 = uncompressed)
+            + b"\x00"        # compression method (ignored when flag=0)
+            + b"\x00"        # language tag terminator (empty)
+            + b"\x00"        # translated keyword terminator (empty)
+            + text_bytes
+        )
+        ctype = b"iTXt"
+    crc = zlib.crc32(ctype + chunk_data) & 0xFFFFFFFF
+    return (
+        struct.pack(">I", len(chunk_data))
+        + ctype
+        + chunk_data
+        + struct.pack(">I", crc)
+    )
+
+
+def _decode_text_bytes(text_bytes: bytes) -> str:
+    """Decode PNG text-chunk bytes the way the SD ecosystem expects.
+
+    tEXt per spec is ISO-8859-1; iTXt is UTF-8. But older A1111
+    versions wrote tEXt with raw UTF-8 bytes (non-spec). To handle
+    both cleanly without mojibake either way, we try strict UTF-8
+    first — that covers spec-compliant iTXt, ASCII tEXt, and the
+    legacy A1111 utf8-in-tEXt convention. We fall back to latin-1
+    only when UTF-8 fails, which is the spec-compliant decoding for
+    tEXt with accented characters.
+    """
+    try:
+        return text_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return text_bytes.decode("latin-1", errors="replace")
+
+
+def _read_png_parameters(path: Path) -> str:
+    """Return the raw `parameters` text value from a PNG, or ''.
+
+    Reads via raw chunk parsing rather than PIL so the caller doesn't
+    accidentally re-encode anything when they later write. Handles
+    both tEXt and iTXt chunks; for iTXt with compression we
+    transparently inflate before decoding.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if not data.startswith(_PNG_SIGNATURE):
+        return ""
+    for _, _, ctype, cdata, _ in _iter_png_chunks(data):
+        if ctype == b"tEXt":
+            sep = cdata.find(b"\x00")
+            if sep == -1:
+                continue
+            keyword = cdata[:sep].decode("latin-1", errors="replace")
+            if keyword == "parameters":
+                return _decode_text_bytes(cdata[sep + 1:])
+        elif ctype == b"iTXt":
+            sep = cdata.find(b"\x00")
+            if sep == -1:
+                continue
+            keyword = cdata[:sep].decode("latin-1", errors="replace")
+            if keyword != "parameters":
+                continue
+            # iTXt: keyword\0 comp_flag(1) comp_method(1) lang\0
+            # translated_keyword\0 text
+            rest = cdata[sep + 1:]
+            if len(rest) < 2:
+                continue
+            comp_flag = rest[0]
+            # Skip past the language tag and translated keyword.
+            after_method = rest[2:]
+            lang_end = after_method.find(b"\x00")
+            if lang_end == -1:
+                continue
+            after_lang = after_method[lang_end + 1:]
+            tkw_end = after_lang.find(b"\x00")
+            if tkw_end == -1:
+                continue
+            text_bytes = after_lang[tkw_end + 1:]
+            if comp_flag == 1:
+                try:
+                    text_bytes = zlib.decompress(text_bytes)
+                except zlib.error:
+                    continue
+            # iTXt is always UTF-8 per spec; replace on malformed
+            # input rather than raising, since dropping the whole
+            # chunk would be more destructive.
+            return text_bytes.decode("utf-8", errors="replace")
+    return ""
+
+
+def _read_jpeg_parameters(path: Path) -> str:
+    """Return the EXIF UserComment text from a JPEG, or ''.
+
+    UserComment is encoded as `<charset 8 bytes><payload>` per the
+    EXIF spec. piexif.helper.UserComment.load handles all four standard
+    charsets (UNICODE/ASCII/JIS/undefined) and returns a Python string.
+    """
+    try:
+        exif_dict = piexif.load(str(path))
+    except Exception:
+        return ""
+    exif_ifd = exif_dict.get("Exif") or {}
+    uc = exif_ifd.get(piexif.ExifIFD.UserComment)
+    if not uc:
+        return ""
+    try:
+        return piexif.helper.UserComment.load(uc) or ""
+    except Exception:
+        # Some files store raw text without the charset header — fall
+        # back to a best-effort decode rather than dropping the value.
+        if isinstance(uc, bytes):
+            return uc.decode("utf-8", errors="replace").lstrip("\x00")
+        return str(uc)
+
+
+# --- Low-level writers ---------------------------------------------
+
+class EmbedError(Exception):
+    """Raised when an embed operation cannot be completed safely.
+
+    The caller is expected to catch this, log it, and move on — one
+    bad file never aborts a batch.
+    """
+
+
+def _atomic_replace(tmp: Path, target: Path) -> None:
+    """Promote a fully-written tempfile to its final name atomically.
+
+    os.replace is atomic on the same filesystem (POSIX rename(2)
+    semantics), so a crash mid-rename either leaves the original or
+    the new file — never a half-state.
+    """
+    os.replace(tmp, target)
+
+
+def _maybe_backup(path: Path, enabled: bool) -> Optional[Path]:
+    """Copy the original to `<name>.civitai-orig` once, if backups are
+    on. Subsequent calls don't overwrite an existing backup — that
+    would lose the true original after a second apply.
+    """
+    if not enabled:
+        return None
+    bk = path.with_name(path.name + ".civitai-orig")
+    if not bk.exists():
+        shutil.copy2(path, bk)
+    return bk
+
+
+def _verify_png_after_write(
+    tmp: Path,
+    expected_size: Tuple[int, int],
+    expected_params: str,
+) -> None:
+    """Open the tempfile and confirm it's a valid PNG with the params
+    we just wrote and dimensions matching the original. Raises
+    EmbedError if anything is off.
+    """
+    try:
+        with Image.open(tmp) as img:
+            img.verify()
+    except (UnidentifiedImageError, OSError) as exc:
+        raise EmbedError(f"verify failed (not a valid PNG): {exc}")
+    # Image.verify closes the image; reopen to read size + chunks.
+    try:
+        with Image.open(tmp) as img:
+            if img.format != "PNG":
+                raise EmbedError(
+                    f"format changed: PNG → {img.format}"
+                )
+            if img.size != expected_size:
+                raise EmbedError(
+                    f"dimensions changed: {expected_size} → {img.size}"
+                )
+    except (UnidentifiedImageError, OSError) as exc:
+        raise EmbedError(f"reopen failed: {exc}")
+    actual = _read_png_parameters(tmp)
+    if actual != expected_params:
+        raise EmbedError(
+            "round-trip mismatch: written parameters not readable back"
+        )
+
+
+def _verify_jpeg_after_write(
+    tmp: Path,
+    expected_size: Tuple[int, int],
+    expected_params: str,
+) -> None:
+    """Same shape as _verify_png_after_write but for JPEG output."""
+    try:
+        with Image.open(tmp) as img:
+            img.verify()
+    except (UnidentifiedImageError, OSError) as exc:
+        raise EmbedError(f"verify failed (not a valid JPEG): {exc}")
+    try:
+        with Image.open(tmp) as img:
+            if img.format != "JPEG":
+                raise EmbedError(
+                    f"format changed: JPEG → {img.format}"
+                )
+            if img.size != expected_size:
+                raise EmbedError(
+                    f"dimensions changed: {expected_size} → {img.size}"
+                )
+    except (UnidentifiedImageError, OSError) as exc:
+        raise EmbedError(f"reopen failed: {exc}")
+    actual = _read_jpeg_parameters(tmp)
+    if actual != expected_params:
+        raise EmbedError(
+            "round-trip mismatch: written UserComment not readable back"
+        )
+
+
+def _write_png_with_parameters(path: Path, params_string: str) -> None:
+    """Rewrite a PNG, replacing (or inserting) a single `parameters`
+    tEXt chunk while leaving every other byte untouched.
+
+    Implementation: walk chunks, drop any pre-existing `parameters`
+    tEXt/iTXt, insert the new tEXt right before the first IDAT.
+    Recomputes CRC for the new chunk only. The IDAT (pixel) stream is
+    never decoded.
+    """
+    data = path.read_bytes()
+    if not data.startswith(_PNG_SIGNATURE):
+        raise EmbedError("not a PNG (signature missing)")
+
+    new_chunk = _build_text_chunk("parameters", params_string)
+
+    out = bytearray(_PNG_SIGNATURE)
+    inserted = False
+    for _, _, ctype, cdata, crc in _iter_png_chunks(data):
+        # Drop existing parameters chunks (tEXt or iTXt) — we replace
+        # them with our merged version. Other tEXt/iTXt chunks pass
+        # through unchanged.
+        if ctype in (b"tEXt", b"iTXt"):
+            sep = cdata.find(b"\x00")
+            if sep != -1:
+                keyword = cdata[:sep].decode(
+                    "latin-1", errors="replace"
+                )
+                if keyword == "parameters":
+                    continue
+        if not inserted and ctype == b"IDAT":
+            out.extend(new_chunk)
+            inserted = True
+        # Re-emit the chunk byte-for-byte (length+type+data+crc).
+        out.extend(struct.pack(">I", len(cdata)))
+        out.extend(ctype)
+        out.extend(cdata)
+        out.extend(crc)
+
+    if not inserted:
+        # No IDAT means a malformed PNG — refuse rather than guess.
+        raise EmbedError("no IDAT chunk found; refusing to write")
+
+    tmp = path.with_name(path.name + ".tmp.civitai-meta")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(bytes(out))
+            f.flush()
+            os.fsync(f.fileno())
+        with Image.open(path) as orig:
+            expected_size = orig.size
+        _verify_png_after_write(tmp, expected_size, params_string)
+        _atomic_replace(tmp, path)
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _write_jpeg_with_parameters(
+    path: Path, params_string: str
+) -> None:
+    """Embed UserComment via piexif. Only the EXIF APP1 segment of the
+    JPEG is rewritten; the compressed image stream is untouched
+    byte-for-byte.
+
+    Existing EXIF fields (camera tags, datetimes, etc.) are preserved
+    by loading-modifying-dumping rather than building a fresh EXIF
+    dict from scratch.
+    """
+    try:
+        existing = piexif.load(str(path))
+    except Exception:
+        # File has no EXIF — start from an empty dict, which piexif
+        # accepts and renders into a minimal valid APP1 segment.
+        existing = {
+            "0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None
+        }
+
+    existing.setdefault("Exif", {})
+    existing["Exif"][piexif.ExifIFD.UserComment] = (
+        piexif.helper.UserComment.dump(params_string, encoding="unicode")
+    )
+
+    # piexif raises on certain malformed tags it can't round-trip
+    # (sometimes thumbnail data or oversized values). When that
+    # happens, retry without the thumbnail — it's the most common
+    # culprit and is non-essential.
+    try:
+        exif_bytes = piexif.dump(existing)
+    except Exception:
+        existing["thumbnail"] = None
+        existing["1st"] = {}
+        exif_bytes = piexif.dump(existing)
+
+    tmp = path.with_name(path.name + ".tmp.civitai-meta")
+    try:
+        shutil.copy2(path, tmp)
+        piexif.insert(exif_bytes, str(tmp))
+        with Image.open(path) as orig:
+            expected_size = orig.size
+        _verify_jpeg_after_write(tmp, expected_size, params_string)
+        _atomic_replace(tmp, path)
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
+# --- Top-level orchestrator ----------------------------------------
+
+class EnrichStatus:
+    """Discrete outcomes from enrich_file. Strings so the report can
+    bucket without translating an enum."""
+    CHANGED = "changed"
+    NO_CHANGE = "no_change"
+    NO_API_DATA = "no_api_data"
+    UNSUPPORTED = "unsupported_format"
+    NOT_FOUND = "not_found"
+    ERROR = "error"
+
+
+class EnrichResult(NamedTuple):
+    """Per-file outcome of an enrichment call.
+
+    - `status` — one of the EnrichStatus constants.
+    - `added_keys` — keys the merge contributed when status==CHANGED.
+    - `notes` — human-readable lines describing any non-trivial
+      decisions the merge made (e.g. "rescued JSON-shaped prompt").
+      Empty for plain gap-fill operations. Surfaced in the report.
+    - `error` — populated only when status==ERROR.
+    """
+    status: str
+    added_keys: List[str]
+    notes: List[str]
+    error: Optional[str]
+
+
+def enrich_file(
+    path: Path,
+    api_meta: Optional[Dict[str, Any]],
+    *,
+    dry_run: bool = False,
+    backup: bool = False,
+) -> EnrichResult:
+    """Merge api_meta into the file at `path`, non-destructively.
+
+    - Existing embedded keys are NEVER overwritten.
+    - A single `parameters` slot is rewritten (no duplicates).
+    - If the merge produces no new keys, the file is not touched.
+    - WEBP and other formats we can't safely patch return UNSUPPORTED
+      rather than raising.
+
+    Set dry_run=True to compute what would change without writing.
+    Set backup=True to copy the original to `<name>.civitai-orig`
+    before the first write (subsequent writes do not re-backup).
+    """
+    if not path.exists():
+        return EnrichResult(EnrichStatus.NOT_FOUND, [], [], None)
+
+    if not api_meta:
+        return EnrichResult(EnrichStatus.NO_API_DATA, [], [], None)
+
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except OSError as exc:
+        return EnrichResult(
+            EnrichStatus.ERROR, [], [], f"read failed: {exc}"
+        )
+
+    fmt = _detect_image_format(head)
+    if fmt not in ("png", "jpeg"):
+        return EnrichResult(EnrichStatus.UNSUPPORTED, [], [], None)
+
+    try:
+        existing_raw = (
+            _read_png_parameters(path)
+            if fmt == "png"
+            else _read_jpeg_parameters(path)
+        )
+    except Exception as exc:
+        return EnrichResult(
+            EnrichStatus.ERROR, [], [], f"read existing failed: {exc}"
+        )
+
+    file_meta = parse_a1111_params(existing_raw) if existing_raw else {}
+    merge = merge_meta_nondestructive(file_meta, api_meta)
+    if not merge.changed:
+        return EnrichResult(EnrichStatus.NO_CHANGE, [], [], None)
+
+    new_params = format_a1111_params(merge.merged)
+    if not new_params:
+        # API meta normalised to nothing (e.g. all empty strings).
+        return EnrichResult(EnrichStatus.NO_CHANGE, [], [], None)
+
+    # Belt-and-braces: if the formatted output is byte-identical to
+    # what's already in the file, skip the write — protects against
+    # over-eager "added_keys" counts if normalisation round-trips
+    # unchanged.
+    if new_params == existing_raw:
+        return EnrichResult(EnrichStatus.NO_CHANGE, [], [], None)
+
+    # Round-trip safety: parse what we're about to write and confirm
+    # every key/value the file currently has is preserved (under
+    # SOME key in the output). If our formatter would drop or mangle
+    # an existing field, REFUSE to write — better to leave the file
+    # alone than silently lose something the user wanted to keep.
+    #
+    # The JSON-prompt rescue is the one intentional value change:
+    # the file's JSON `prompt` is moved to `Civitai source prompt`
+    # so the API's real prompt can take the prompt slot. We allow
+    # that specific case by checking the rescued JSON is still
+    # present under the side key.
+    if file_meta:
+        roundtrip = parse_a1111_params(new_params)
+        for k, v in file_meta.items():
+            # Empty/whitespace-only file values are intentionally
+            # dropped by _normalize_meta — they carry no information.
+            # Their absence from the round-trip output is expected,
+            # not data loss. (E.g. a ComfyUI export that left
+            # `Model: ` with no value.)
+            if isinstance(v, str) and not v.strip():
+                continue
+            if k not in roundtrip:
+                # Permit the JSON-prompt rescue: original prompt
+                # value is preserved under `Civitai source prompt`.
+                if k == "prompt" and _looks_like_json_dump(v):
+                    csp = roundtrip.get("Civitai source prompt")
+                    if csp and str(csp).strip() == str(v).strip():
+                        continue
+                return EnrichResult(
+                    EnrichStatus.ERROR,
+                    [],
+                    [],
+                    f"round-trip would drop key {k!r}; refusing to "
+                    f"write to protect existing data",
+                )
+            # Compare as strings — types may shift (int vs str)
+            # across the format/parse boundary, but the textual
+            # content must match.
+            if str(roundtrip[k]).strip() != str(v).strip():
+                # Same rescue permission: prompt value changed
+                # because we moved the JSON; check it's preserved.
+                if k == "prompt" and _looks_like_json_dump(v):
+                    csp = roundtrip.get("Civitai source prompt")
+                    if csp and str(csp).strip() == str(v).strip():
+                        continue
+                return EnrichResult(
+                    EnrichStatus.ERROR,
+                    [],
+                    [],
+                    f"round-trip would change value of {k!r} "
+                    f"({v!r} → {roundtrip[k]!r}); refusing to write",
+                )
+
+    if dry_run:
+        return EnrichResult(
+            EnrichStatus.CHANGED,
+            list(merge.added_keys),
+            list(merge.notes),
+            None,
+        )
+
+    try:
+        _maybe_backup(path, backup)
+        if fmt == "png":
+            _write_png_with_parameters(path, new_params)
+        else:
+            _write_jpeg_with_parameters(path, new_params)
+    except Exception as exc:
+        return EnrichResult(EnrichStatus.ERROR, [], [], str(exc))
+
+    return EnrichResult(
+        EnrichStatus.CHANGED,
+        list(merge.added_keys),
+        list(merge.notes),
+        None,
+    )
+
+
+# ---------------------------------------------------------------------
+# End of metadata embedding helpers
+# ---------------------------------------------------------------------
 
 
 class CivitAIFetcher:
@@ -389,7 +1551,8 @@ class CivitAIFetcher:
         self,
         url: str,
         output_dir: Path,
-        image_id: Any
+        image_id: Any,
+        api_meta: Optional[Dict[str, Any]] = None,
     ) -> Optional[Path]:
         """Download an image and save with extension inferred from bytes.
 
@@ -398,6 +1561,13 @@ class CivitAIFetcher:
         so we sniff the magic bytes and pick the extension ourselves.
         Returns the final saved Path, or None if the download failed or
         the content wasn't a supported image format (e.g. video).
+
+        When `api_meta` is supplied, the saved file is also enriched
+        with the generation parameters from the API. This is a no-op
+        for files the CDN already served with full embedded metadata,
+        and otherwise patches in the missing fields non-destructively.
+        Enrichment failures don't fail the download — we log and keep
+        the raw file, since a metadata-less image is still useful.
         """
         try:
             response = self.session.get(url, stream=True, timeout=30)
@@ -415,6 +1585,24 @@ class CivitAIFetcher:
             output_path = output_dir / f"{image_id}.{ext}"
             with open(output_path, 'wb') as f:
                 f.write(content)
+
+            if api_meta:
+                result = enrich_file(output_path, api_meta)
+                if result.status == EnrichStatus.ERROR:
+                    # The original download is intact (enrich uses
+                    # tempfile+atomic-rename); just warn so the user
+                    # knows this image's metadata wasn't patched.
+                    print(
+                        f"      ⚠️  Metadata embed failed for "
+                        f"{image_id}: {result.error}"
+                    )
+                elif result.status == EnrichStatus.CHANGED:
+                    print(
+                        f"      ➕ Embedded {len(result.added_keys)} "
+                        f"missing field(s): "
+                        f"{', '.join(result.added_keys[:5])}"
+                        + ("..." if len(result.added_keys) > 5 else "")
+                    )
 
             return output_path
         except Exception as e:
@@ -1255,8 +2443,24 @@ def run_config_wizard(config_path: str) -> None:
     )
 
     output = Path(config_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_yaml_write(output, cfg)
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_yaml_write(output, cfg)
+    except Exception as exc:
+        # Disk full, permission denied, weird FS state — the user has
+        # just answered six prompts. Don't make them re-do that work:
+        # dump the YAML to stdout so they can paste it themselves.
+        print(
+            f"\n❌ Couldn't write to {output}: {exc}\n"
+            "   Your answers are below — paste this into the file "
+            "manually and re-run:\n"
+        )
+        print("---")
+        print(yaml.safe_dump(
+            cfg, sort_keys=False, default_flow_style=False
+        ).rstrip())
+        print("---")
+        sys.exit(1)
 
     print(f"\n✅ Config written to: {output}")
     print(
@@ -1273,7 +2477,6 @@ def _atomic_yaml_write(path: Path, data: Dict[str, Any]) -> None:
     run with a YAML parse error. `Path.replace` is atomic on POSIX and
     overwrites on Windows.
     """
-    import os
     tmp = path.with_name(f'.{path.name}.tmp')
     try:
         with open(tmp, 'w', encoding='utf-8') as f:
@@ -1315,6 +2518,171 @@ def save_to_config(
     for section, fields in updates.items():
         cfg.setdefault(section, {}).update(fields)
     _atomic_yaml_write(path, cfg)
+
+
+def _apply_cli_overrides_to_config(
+    config: Dict[str, Any],
+    args: argparse.Namespace
+) -> None:
+    """Fold flag-level overrides into the loaded config dict.
+
+    Run once, before any code consumes the config — both the
+    interactive flow's status header and main()'s execution path
+    should see the same effective values, regardless of whether the
+    user provided them on the CLI or in YAML.
+
+    Only the overrides that affect either the interactive flow's
+    display/decisions or downstream config consumers live here; per-run
+    knobs that main() reads off ``args`` directly (delay, api-delay,
+    sort, period, limit, nsfw, etc.) are intentionally not mirrored
+    into config — the args namespace is their canonical home.
+    """
+    if args.vault_path:
+        config.setdefault("obsidian", {})["vault_path"] = args.vault_path
+    if args.api_key:
+        config.setdefault("civitai", {})["api_key"] = args.api_key
+
+
+def _build_fetcher(
+    config: Dict[str, Any],
+    api_key_override: Optional[str] = None
+) -> CivitAIFetcher:
+    """Construct a CivitAIFetcher from config, with an optional override.
+
+    Single source of truth for fetcher wiring so the interactive flow
+    and main() stay in sync — previously they each instantiated the
+    fetcher independently, and the interactive version didn't honor
+    ``args.api_key``. The override wins when set so a CLI flag still
+    beats whatever the YAML carries.
+    """
+    civitai_cfg = config.get("civitai", {})
+    rate_limits = config.get("rate_limits", {})
+    return CivitAIFetcher(
+        api_key=api_key_override or civitai_cfg.get("api_key"),
+        base_url=civitai_cfg.get(
+            "base_url", "https://civitai.com/api/v1"
+        ),
+        max_retries=rate_limits.get("max_retries", 3),
+        backoff_factor=rate_limits.get("backoff_factor", 1)
+    )
+
+
+class TargetPaths(NamedTuple):
+    """The note file and image folder a run will read from or write to."""
+    note_path: Path
+    images_folder: Path
+
+
+def compute_target_paths(
+    generator: ObsidianPageGenerator,
+    model_data: Dict[str, Any],
+    version_id: Optional[int]
+) -> TargetPaths:
+    """Compute the (note, images folder) a run targets.
+
+    Single source of truth for path resolution — previously inlined in
+    both main() and run_interactive_flow, where the two copies had
+    already started drifting on error-message indentation. A fresh
+    fetch and an update both land at exactly these paths.
+    """
+    formatted_title = generator.format_title(model_data, version_id)
+    note_dir = generator.get_note_directory(model_data, version_id)
+    note_path = note_dir / f"{formatted_title}.md"
+    folder_name = ObsidianPageGenerator.build_image_folder_name(
+        model_data, version_id
+    )
+    return TargetPaths(note_path, generator.media_folder / folder_name)
+
+
+class UpdatePreflight(NamedTuple):
+    """Result of running the update-mode pre-flight checks.
+
+    `problems` is non-empty when the run must abort. `warning` is
+    informational only — printed but doesn't stop the run.
+    `existing_content` is the note's text when read successfully (used
+    by main() to compute already-known image IDs); None when the
+    check bailed before reading the file.
+    """
+    problems: List[str]
+    warning: Optional[str]
+    existing_content: Optional[str]
+
+
+def check_update_preflight(
+    paths: TargetPaths,
+    expected_source: str
+) -> UpdatePreflight:
+    """Verify an update can run against the given target paths.
+
+    Two checks run in priority order:
+
+    1. Both the note and the image folder must exist and be the right
+       kind of filesystem object. If not, problems are collected and
+       returned without reading the file — there's nothing to verify
+       yet.
+    2. If the file is readable, its `source:` frontmatter must match
+       the model we're about to update. Two different models can
+       produce notes with the same title (e.g. both LoRAs named
+       "Style Test" on SDXL); the source field is the authoritative
+       pointer back to CivitAI.
+
+    Returning a result struct (rather than printing + sys.exit) lets
+    each caller render its own error UX — the interactive flow uses
+    a different leading message than main() does, since the user's
+    next action ("re-run without --update" vs "answer the prompt
+    differently") differs by context.
+    """
+    problems: List[str] = []
+    if not paths.note_path.exists():
+        problems.append(
+            f"Obsidian note not found at:\n      {paths.note_path}"
+        )
+    elif not paths.note_path.is_file():
+        problems.append(
+            f"Path exists but is not a regular file:\n"
+            f"      {paths.note_path}"
+        )
+    if not paths.images_folder.exists():
+        problems.append(
+            f"Image folder not found at:\n      "
+            f"{paths.images_folder}"
+        )
+    elif not paths.images_folder.is_dir():
+        problems.append(
+            f"Image folder path exists but is not a directory:\n"
+            f"      {paths.images_folder}"
+        )
+
+    if problems:
+        return UpdatePreflight(problems, None, None)
+
+    existing_content = paths.note_path.read_text(encoding='utf-8')
+    existing_source = (
+        ObsidianPageGenerator.extract_frontmatter_field(
+            existing_content, 'source'
+        )
+    )
+
+    warning: Optional[str] = None
+    if existing_source is None:
+        warning = (
+            "Existing note has no `source:` field in its frontmatter "
+            "— skipping model-match verification. If this note wasn't "
+            "generated by this script, double-check the path is right "
+            "before proceeding."
+        )
+    elif existing_source.rstrip('/') != expected_source:
+        problems.append(
+            "The existing note at this path belongs to a different "
+            "model.\n"
+            f"      Expected source: {expected_source}\n"
+            f"      Note's source:   {existing_source}\n"
+            "      Refusing to update — appending here would corrupt "
+            "that other note."
+        )
+        return UpdatePreflight(problems, None, None)
+
+    return UpdatePreflight([], warning, existing_content)
 
 
 def _build_version_choice(version: Dict[str, Any]) -> Any:
@@ -1380,11 +2748,11 @@ def run_interactive_flow(
             )).strip()
             if new_key:
                 # Mutate the in-memory config so the fetcher built
-                # below picks it up; main() also reads from the same
-                # config dict, so a single assignment covers both
-                # the prefetch and the actual run.
+                # below (which re-reads from config) picks it up;
+                # main() also reads from the same config dict, so a
+                # single assignment covers both the prefetch and the
+                # actual run.
                 config.setdefault("civitai", {})["api_key"] = new_key
-                civitai_cfg = config["civitai"]
                 if _ask_or_exit(q.confirm(
                     "Save the key to config.yaml for future runs?",
                     default=True
@@ -1433,16 +2801,10 @@ def run_interactive_flow(
     #    relative to the run that follows, but it's worth it for the
     #    UX win — the user gets to confirm "yes, that's the right
     #    model" before committing to any downloads.
-    civitai_cfg = config.get("civitai", {})
-    rate_limits = config.get("rate_limits", {})
-    fetcher = CivitAIFetcher(
-        api_key=civitai_cfg.get("api_key"),
-        base_url=civitai_cfg.get(
-            "base_url", "https://civitai.com/api/v1"
-        ),
-        max_retries=rate_limits.get("max_retries", 3),
-        backoff_factor=rate_limits.get("backoff_factor", 1)
-    )
+    # CLI overrides have already been folded into `config` by
+    # _apply_cli_overrides_to_config, so the fetcher picks up
+    # --api-key without any extra wiring here.
+    fetcher = _build_fetcher(config)
 
     model_id, version_from_url = fetcher.extract_model_id(model_input)
     print("\nFetching model details...")
@@ -1489,66 +2851,55 @@ def run_interactive_flow(
     #    (b) when update is on we run the same pre-flight checks main()
     #        runs, so the user discovers a missing note immediately
     #        rather than after walking through every other prompt.
-    args.update = _ask_or_exit(q.confirm(
-        "Update an existing note (append new images) instead of "
-        "generating fresh?",
-        default=False
-    ))
+    #
+    # Skipped when --update is already on the CLI — the user has been
+    # explicit and we shouldn't pretend they haven't been.
+    if not args.update:
+        args.update = _ask_or_exit(q.confirm(
+            "Update an existing note (append new images) instead of "
+            "generating fresh?",
+            default=False
+        ))
 
-    # 5) Pre-flight when updating: compute the same paths main() will
-    #    use and bail out now if the note or image folder is missing.
-    #    Duplicates the check inside main() but firing it here saves
-    #    the user from going through the rest of the prompts only to
-    #    hit a "note not found" wall.
+    # Mutual-exclusion guard runs *before* the rest of the prompts so
+    # a user who passed --skip-download on the CLI and then picks
+    # update interactively finds out now, not after answering 5 more
+    # questions and the summary screen.
+    if args.update and args.skip_download:
+        print(
+            "\n❌ --update and --skip-download cannot be combined.\n"
+            "   You passed --skip-download but chose update mode here."
+        )
+        sys.exit(1)
+
+    # 5) Pre-flight when updating: run the same checks main() runs, in
+    #    the same order. Bailing out here saves the user from walking
+    #    through the rest of the prompts only to hit "note not found"
+    #    or "wrong model" deeper in the run. The helper is the single
+    #    source of truth — main() calls it too.
     if args.update:
-        generator = ObsidianPageGenerator(config=config)
-        formatted_title = generator.format_title(
-            model_data, chosen_version_id
+        preflight_generator = ObsidianPageGenerator(config=config)
+        preflight_paths = compute_target_paths(
+            preflight_generator, model_data, chosen_version_id
         )
-        page_filename = f"{formatted_title}.md"
-        note_dir = generator.get_note_directory(
-            model_data, chosen_version_id
+        expected_source = f"https://civitai.com/models/{model_id}"
+        preflight = check_update_preflight(
+            preflight_paths, expected_source
         )
-        note_path = note_dir / page_filename
-
-        folder_name = ObsidianPageGenerator.build_image_folder_name(
-            model_data, chosen_version_id
-        )
-        images_folder = generator.media_folder / folder_name
-
-        problems: List[str] = []
-        if not note_path.exists():
-            problems.append(
-                f"Obsidian note not found at:\n        {note_path}"
-            )
-        elif not note_path.is_file():
-            problems.append(
-                f"Path exists but is not a regular file:\n"
-                f"        {note_path}"
-            )
-        if not images_folder.exists():
-            problems.append(
-                f"Image folder not found at:\n        "
-                f"{images_folder}"
-            )
-        elif not images_folder.is_dir():
-            problems.append(
-                f"Image folder path exists but is not a "
-                f"directory:\n        {images_folder}"
-            )
-
-        if problems:
+        if preflight.problems:
             print(
-                "\n❌ Update mode can't run — these must exist first:"
+                "\n❌ Update mode can't run — fix the following first:"
             )
-            for p in problems:
+            for p in preflight.problems:
                 print(f"   • {p}")
             print(
-                "\n   Run interactively without update mode first to "
-                "do an initial fetch, or verify the model name / "
-                "version ID matches the original run."
+                "\n   Re-run without update mode to do an initial "
+                "fetch, or verify the model name / version ID matches "
+                "what was used originally."
             )
             sys.exit(1)
+        if preflight.warning:
+            print(f"\n⚠️  {preflight.warning}")
 
     # 6) Sort / period — defaults swap based on update mode to match
     #    the CLI behavior: an update is looking for what's *new*, so
@@ -1561,63 +2912,77 @@ def run_interactive_flow(
         sort_default = defaults.get("sort_order", "Most Reactions")
         period_default = defaults.get("time_period", "AllTime")
 
-    args.sort = _ask_or_exit(q.select(
-        "Sort order:",
-        choices=["Most Reactions", "Newest", "Most Comments"],
-        default=sort_default
-    ))
+    # Each of the remaining prompts is skipped when the user already
+    # provided the value on the CLI — `-i --sort Newest --limit 50`
+    # should ask only for what's left, not silently overwrite the
+    # explicit choices. argparse defaults the value flags to None,
+    # which is our "ask the user" signal.
+    if args.sort is None:
+        args.sort = _ask_or_exit(q.select(
+            "Sort order:",
+            choices=["Most Reactions", "Newest", "Most Comments"],
+            default=sort_default
+        ))
 
-    args.period = _ask_or_exit(q.select(
-        "Time period:",
-        choices=["AllTime", "Year", "Month", "Week", "Day"],
-        default=period_default
-    ))
+    if args.period is None:
+        args.period = _ask_or_exit(q.select(
+            "Time period:",
+            choices=["AllTime", "Year", "Month", "Week", "Day"],
+            default=period_default
+        ))
 
     # 7) NSFW
-    nsfw_default = defaults.get("nsfw_filter", "all")
-    args.nsfw = _ask_or_exit(q.select(
-        "NSFW filter:",
-        choices=[
-            q.Choice("All (no filter)", value="all"),
-            q.Choice("SFW only (block NSFW)", value="block"),
-            q.Choice("NSFW only", value="allow"),
-        ],
-        default=nsfw_default
-    ))
+    if args.nsfw is None:
+        nsfw_default = defaults.get("nsfw_filter", "all")
+        args.nsfw = _ask_or_exit(q.select(
+            "NSFW filter:",
+            choices=[
+                q.Choice("All (no filter)", value="all"),
+                q.Choice("SFW only (block NSFW)", value="block"),
+                q.Choice("NSFW only", value="allow"),
+            ],
+            default=nsfw_default
+        ))
 
     # 8) Limit — text input with a real integer validator
-    def _validate_limit(s: str) -> Any:
-        if not s.isdigit():
-            return "Enter a positive integer"
-        if int(s) <= 0:
-            return "Must be greater than zero"
-        return True
+    if args.limit is None:
+        def _validate_limit(s: str) -> Any:
+            if not s.isdigit():
+                return "Enter a positive integer"
+            if int(s) <= 0:
+                return "Must be greater than zero"
+            return True
 
-    limit_str = _ask_or_exit(q.text(
-        "Maximum number of images to fetch:",
-        default=str(defaults.get("image_limit", 200)),
-        validate=_validate_limit
-    ))
-    args.limit = int(limit_str)
+        limit_str = _ask_or_exit(q.text(
+            "Maximum number of images to fetch:",
+            default=str(defaults.get("image_limit", 200)),
+            validate=_validate_limit
+        ))
+        args.limit = int(limit_str)
 
     # 9) Quality filters — confirm prompts with True defaults to match
     #    the script's "ship a curated library by default" stance.
-    args.require_meta = _ask_or_exit(q.confirm(
-        "Require generation metadata? (drops meta-less duds)",
-        default=_as_bool(defaults.get("require_meta"), True)
-    ))
-    args.filter_begging = _ask_or_exit(q.confirm(
-        "Filter out 'buzz please' / tip-begging prompts?",
-        default=_as_bool(defaults.get("filter_begging"), True)
-    ))
+    #    BooleanOptionalAction makes --require-meta / --no-require-meta
+    #    set the value to True/False; only None means "not specified".
+    if args.require_meta is None:
+        args.require_meta = _ask_or_exit(q.confirm(
+            "Require generation metadata? (drops meta-less duds)",
+            default=_as_bool(defaults.get("require_meta"), True)
+        ))
+    if args.filter_begging is None:
+        args.filter_begging = _ask_or_exit(q.confirm(
+            "Filter out 'buzz please' / tip-begging prompts?",
+            default=_as_bool(defaults.get("filter_begging"), True)
+        ))
 
-    # 10) Skip-download — mutually exclusive with update mode, so only
-    #     prompt when update is off. Set the value explicitly in both
-    #     branches rather than relying on argparse's default; that way
-    #     a future change to argparse can't silently flip the meaning.
+    # 10) Skip-download — mutually exclusive with update mode, so the
+    #     prompt only fires when update is off AND the CLI didn't
+    #     already set --skip-download. When update is on we force the
+    #     flag to False (the mutual-exclusion conflict for
+    #     CLI-provided --skip-download was already caught above).
     if args.update:
         args.skip_download = False
-    else:
+    elif not args.skip_download:
         args.skip_download = _ask_or_exit(q.confirm(
             "Skip downloads (write the .md only)?",
             default=False
@@ -1839,14 +3204,16 @@ def main() -> None:
         sys.exit(1)
 
     # Interactive mode runs the first-run wizard if config.yaml is
-    # missing, then drives the option-collection through prompts and
-    # mutates `args` in place. Everything after this point is the same
-    # code path as the CLI-driven flow.
+    # missing. We load config and apply CLI overrides *before* the
+    # flow so its status header and pre-flight check see the effective
+    # config (e.g. -i --vault-path /foo should make the flow target
+    # /foo, not whatever YAML carries).
     if args.interactive:
         _require_questionary()
         if not Path(args.config).exists():
             run_config_wizard(args.config)
         config = load_config(args.config)
+        _apply_cli_overrides_to_config(config, args)
         args = run_interactive_flow(config, args)
         # The flow may have flipped args.update on after the
         # skip-download default was already set; re-check the
@@ -1857,15 +3224,13 @@ def main() -> None:
             )
             sys.exit(1)
     else:
-        # Load configuration
         config = load_config(args.config)
+        _apply_cli_overrides_to_config(config, args)
 
-    # Override config with command-line arguments if provided
-    if args.vault_path:
-        config.setdefault("obsidian", {})["vault_path"] = args.vault_path
-
-    # Get API key from args or config
-    api_key = args.api_key or config.get("civitai", {}).get("api_key")
+    # API key resolution: the override is already in config thanks to
+    # _apply_cli_overrides_to_config, so reading from config is the
+    # single source of truth from here on.
+    api_key = config.get("civitai", {}).get("api_key")
 
     # Get rate limits from args or config
     rate_limits = config.get("rate_limits", {})
@@ -1927,17 +3292,9 @@ def main() -> None:
         )
         begging_patterns = compile_begging_patterns(pattern_strings)
 
-    # Initialize
-    civitai_config = config.get("civitai", {})
-    fetcher = CivitAIFetcher(
-        api_key=api_key,
-        base_url=civitai_config.get(
-            "base_url",
-            "https://civitai.com/api/v1"
-        ),
-        max_retries=rate_limits.get("max_retries", 3),
-        backoff_factor=rate_limits.get("backoff_factor", 1)
-    )
+    # CLI overrides have already been folded into `config`, so the
+    # helper reads everything it needs from there.
+    fetcher = _build_fetcher(config)
     generator = ObsidianPageGenerator(config=config)
 
     try:
@@ -1969,23 +3326,15 @@ def main() -> None:
             nsfw_param = False
         # "all" leaves it as None (no filter)
 
-        # Compute target note path up front. In --update mode we need
-        # to read the existing file before fetching, so we always
-        # resolve the path here regardless of mode.
-        formatted_title = generator.format_title(
-            model_data,
-            model_version_id
+        # Compute target paths up front. Used regardless of mode: a
+        # fresh fetch writes here, an update reads from here. Pulled
+        # through the shared helper so the interactive flow's
+        # pre-flight resolves identical paths.
+        target_paths = compute_target_paths(
+            generator, model_data, model_version_id
         )
-        page_filename = f"{formatted_title}.md"
-        note_dir = generator.get_note_directory(
-            model_data, model_version_id
-        )
-        note_path = note_dir / page_filename
-
-        folder_name = ObsidianPageGenerator.build_image_folder_name(
-            model_data, model_version_id
-        )
-        images_folder = generator.media_folder / folder_name
+        note_path = target_paths.note_path
+        images_folder = target_paths.images_folder
 
         # In update mode, refuse to run without a pre-existing note —
         # otherwise the user almost certainly meant a normal run and
@@ -1994,36 +3343,16 @@ def main() -> None:
         existing_content: Optional[str] = None
         known_ids: set[int] = set()
         if args.update:
-            # Pre-flight checks. Both the note and the image folder
-            # must already exist; bail out with a precise diagnostic if
-            # either is missing so the user knows which side to fix.
-            problems: List[str] = []
-            if not note_path.exists():
-                problems.append(
-                    f"Obsidian note not found at:\n      {note_path}"
-                )
-            elif not note_path.is_file():
-                problems.append(
-                    f"Path exists but is not a regular file:\n"
-                    f"      {note_path}"
-                )
-            if not images_folder.exists():
-                problems.append(
-                    f"Image folder not found at:\n      "
-                    f"{images_folder}"
-                )
-            elif not images_folder.is_dir():
-                problems.append(
-                    f"Image folder path exists but is not a "
-                    f"directory:\n      {images_folder}"
-                )
-
-            if problems:
+            expected_source = f"https://civitai.com/models/{model_id}"
+            preflight = check_update_preflight(
+                target_paths, expected_source
+            )
+            if preflight.problems:
                 print(
                     "\n❌ --update pre-flight checks failed. The "
-                    "following must exist before an update can run:"
+                    "following must be fixed before an update can run:"
                 )
-                for p in problems:
+                for p in preflight.problems:
                     print(f"   • {p}")
                 print(
                     "\n   Run without --update to perform a fresh "
@@ -2031,40 +3360,14 @@ def main() -> None:
                     "matches what was used originally."
                 )
                 sys.exit(1)
+            if preflight.warning:
+                print(f"\n⚠️  {preflight.warning}")
 
-            existing_content = note_path.read_text(encoding='utf-8')
-
-            # Verify the note we found actually corresponds to this
-            # model. Two different models can produce the same title
-            # (e.g. both LoRAs named "Style Test" on SDXL), and we'd
-            # otherwise dedupe against — and append to — the wrong
-            # note. The `source:` line in our generated frontmatter is
-            # the authoritative pointer back to the CivitAI model.
-            existing_source = (
-                ObsidianPageGenerator.extract_frontmatter_field(
-                    existing_content, 'source'
-                )
-            )
-            expected_source = (
-                f"https://civitai.com/models/{model_id}"
-            )
-            if existing_source is None:
-                print(
-                    "\n⚠️  Existing note has no `source:` field in its "
-                    "frontmatter — skipping model-match verification. "
-                    "If this note wasn't generated by this script, "
-                    "double-check the path is right before proceeding."
-                )
-            elif existing_source.rstrip('/') != expected_source:
-                print(
-                    "\n❌ The existing note at this path belongs to a "
-                    "different model.\n"
-                    f"   Expected source: {expected_source}\n"
-                    f"   Note's source:   {existing_source}\n"
-                    "   Refusing to update — appending here would "
-                    "corrupt that other note."
-                )
-                sys.exit(1)
+            # preflight.existing_content is non-None whenever there
+            # are no problems — the helper guarantees that contract,
+            # and the assert here narrows the Optional for mypy.
+            assert preflight.existing_content is not None
+            existing_content = preflight.existing_content
 
             md_ids = (
                 ObsidianPageGenerator.extract_image_ids_from_markdown(
@@ -2217,7 +3520,10 @@ def main() -> None:
                     f"{image_id}"
                 )
                 saved = fetcher.download_image(
-                    image_url, images_folder, image_id
+                    image_url,
+                    images_folder,
+                    image_id,
+                    api_meta=image_data.get("meta"),
                 )
                 if saved:
                     downloaded += 1
@@ -2290,7 +3596,6 @@ def main() -> None:
             # a crash mid-write never leaves the user's curated note
             # truncated or partially written. `Path.replace` is atomic
             # on POSIX and overwrites on Windows.
-            import os
             tmp_path = note_path.with_name(
                 f".{note_path.name}.update.tmp"
             )
