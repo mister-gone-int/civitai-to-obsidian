@@ -29,6 +29,13 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Interactive mode is opt-in via --interactive; keep the import soft so a
+# user who never touches that flag doesn't need questionary installed.
+try:
+    import questionary
+except ImportError:  # pragma: no cover — exercised by the install-check path
+    questionary = None  # type: ignore[assignment]
+
 
 # CivitAI's tipping currency is called "Buzz", and a steady stream of
 # low-effort images get posted with prompts like "buzz please" or
@@ -112,6 +119,34 @@ def detect_begging_match(
     return None
 
 
+def _as_bool(value: Any, default: bool) -> bool:
+    """Coerce a config value to a real bool, accepting YAML's many shapes.
+
+    YAML loaders return real booleans for unquoted `true`/`false`, but
+    users routinely quote them ("true") or use yes/no/on/off variants
+    that come back as strings. Without coercion these flow into
+    questionary.confirm's `default=` parameter as truthy non-bools and
+    produce confusing prompt behavior — and elsewhere they sneak into
+    `if config_value:` branches that were meant to short-circuit on
+    literal False but never do.
+
+    Anything that isn't recognizably truthy or falsy falls back to the
+    caller-supplied default, so a malformed entry behaves the same as a
+    missing entry.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ('true', 'yes', 'y', '1', 'on'):
+            return True
+        if v in ('false', 'no', 'n', '0', 'off', ''):
+            return False
+    return default
+
+
 def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
     """Load configuration from YAML file"""
     config_file = Path(config_path)
@@ -164,11 +199,16 @@ class CivitAIFetcher:
 
         return session
 
+    @staticmethod
     def extract_model_id(
-        self,
         url_or_id: str
     ) -> tuple[int, Optional[int]]:
         """Extract model ID and optional modelVersionId from URL or ID
+
+        Pure function — does not touch the session or API key, so it's
+        a staticmethod. Useful for cheap input validation (e.g. the
+        interactive prompt validator) without paying to construct a
+        requests session and retry adapter.
 
         Returns:
             tuple: (model_id, model_version_id)
@@ -1092,13 +1132,601 @@ class ObsidianPageGenerator:
         return filename
 
 
+# --------------------------------------------------------------------- #
+# Interactive mode
+# --------------------------------------------------------------------- #
+#
+# Triggered by --interactive / -i. Two pieces:
+#   1. run_config_wizard() — first-run setup when config.yaml is missing
+#   2. run_interactive_flow() — replaces argparse-driven options with
+#      arrow-key prompts, and offers a real version picker fetched from
+#      the API (the main thing you can't get from a static bash wrapper)
+#
+# Everything here mutates the same argparse.Namespace that the CLI path
+# produces, so the downstream logic in main() doesn't need to branch on
+# how the options were collected.
+
+
+def _require_questionary() -> Any:
+    """Return the questionary module or exit with an install hint.
+
+    Kept as a function (rather than a module-level guard) so the script
+    still runs for users who never pass --interactive and haven't pip
+    installed the new dep.
+    """
+    if questionary is None:
+        print(
+            "❌ Interactive mode needs `questionary`. Install with:\n"
+            "     pip install questionary\n"
+            "   or re-run `pip install -r requirements.txt`."
+        )
+        sys.exit(1)
+    return questionary
+
+
+def _ask_or_exit(prompt: Any) -> Any:
+    """Run a questionary prompt; exit cleanly if the user cancels.
+
+    `.ask()` returns None on Ctrl+C / Esc for every prompt type, which
+    is ambiguous with a legitimate False from a confirm — so we always
+    treat None as "user bailed out" and exit 0 rather than crashing
+    deeper in the flow with an AttributeError.
+    """
+    result = prompt.ask()
+    if result is None:
+        print("\n👋 Cancelled.")
+        sys.exit(0)
+    return result
+
+
+def run_config_wizard(config_path: str) -> None:
+    """Walk the user through creating a config.yaml from scratch.
+
+    Uses config.example.yaml as the baseline so we inherit every comment
+    and sensible default, and only overlay the fields the user provided.
+    The output is written via yaml.safe_dump, which drops the comments —
+    that's a known tradeoff for keeping the wizard simple; the example
+    file stays in the repo as a reference.
+    """
+    q = _require_questionary()
+
+    print("\n👋 No config file found — let's set one up.\n")
+
+    example_path = Path(__file__).parent / "config.example.yaml"
+    if example_path.exists():
+        with open(example_path, 'r', encoding='utf-8') as f:
+            cfg: Dict[str, Any] = yaml.safe_load(f) or {}
+    else:
+        cfg = {}
+
+    # Vault path: we only hard-reject paths that exist but aren't
+    # directories (a file or symlink at the vault location is almost
+    # certainly a typo). Missing paths are accepted with a confirm —
+    # legitimate when the user is creating a new vault, or pointing at
+    # a directory they're about to mount/sync.
+    def _validate_dir(p: str) -> Any:
+        if not p.strip():
+            return "Required"
+        expanded = Path(p).expanduser()
+        if expanded.exists() and not expanded.is_dir():
+            return f"Path exists but is not a directory: {expanded}"
+        return True
+
+    while True:
+        vault_raw = _ask_or_exit(q.path(
+            "Path to your Obsidian vault:",
+            only_directories=True,
+            validate=_validate_dir
+        ))
+        expanded_vault = Path(vault_raw).expanduser()
+        if expanded_vault.exists():
+            break
+        # Missing path — likely correct (new vault) but plausibly a
+        # typo, so make the user confirm rather than silently accepting.
+        if _ask_or_exit(q.confirm(
+            f"'{expanded_vault}' doesn't exist yet. Use it anyway?",
+            default=False
+        )):
+            break
+        # User said no — loop back and let them re-enter.
+    cfg.setdefault("obsidian", {})["vault_path"] = str(expanded_vault)
+
+    author = _ask_or_exit(q.text(
+        "Your name (used in the `author:` frontmatter field):",
+        default=cfg.get("metadata", {}).get("author", "Your Name")
+    ))
+    cfg.setdefault("metadata", {})["author"] = author or "Your Name"
+
+    api_key = _ask_or_exit(q.password(
+        "CivitAI API key (optional — hit Enter to skip):"
+    ))
+    if api_key:
+        cfg.setdefault("civitai", {})["api_key"] = api_key
+
+    base_dir_default = cfg.get("obsidian", {}).get(
+        "base_directory", "Diffusion"
+    )
+    base_dir = _ask_or_exit(q.text(
+        "Base directory in vault for notes:",
+        default=base_dir_default
+    ))
+    cfg.setdefault("obsidian", {})["base_directory"] = (
+        base_dir or base_dir_default
+    )
+
+    output = Path(config_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_yaml_write(output, cfg)
+
+    print(f"\n✅ Config written to: {output}")
+    print(
+        "   You can edit it directly any time — see config.example.yaml "
+        "for the full set of options.\n"
+    )
+
+
+def _atomic_yaml_write(path: Path, data: Dict[str, Any]) -> None:
+    """Write a YAML dict atomically: stage in tmp, fsync, rename.
+
+    Mirrors the update-mode write in main() — a crash mid-write should
+    never leave config.yaml truncated, since that would brick the next
+    run with a YAML parse error. `Path.replace` is atomic on POSIX and
+    overwrites on Windows.
+    """
+    import os
+    tmp = path.with_name(f'.{path.name}.tmp')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(
+                data, f, sort_keys=False, default_flow_style=False
+            )
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def save_to_config(
+    config_path: str,
+    updates: Dict[str, Dict[str, Any]]
+) -> None:
+    """Merge sectioned updates into an existing config.yaml.
+
+    `updates` maps top-level section name → field dict, e.g.
+    ``{'defaults': {'sort_order': 'Newest'}, 'civitai': {'api_key': '…'}}``.
+    Sections that don't exist yet are created.
+
+    Comments in config.yaml are lost on round-trip (yaml.safe_dump
+    doesn't preserve them). Callers should warn the user up front so
+    they can opt out — see how run_interactive_flow uses this.
+    """
+    path = Path(config_path)
+    if path.exists():
+        with open(path, 'r', encoding='utf-8') as f:
+            cfg: Dict[str, Any] = yaml.safe_load(f) or {}
+    else:
+        cfg = {}
+    for section, fields in updates.items():
+        cfg.setdefault(section, {}).update(fields)
+    _atomic_yaml_write(path, cfg)
+
+
+def _build_version_choice(version: Dict[str, Any]) -> Any:
+    """Render one model-version entry as a questionary choice.
+
+    Pulls the human name, base model, and id into a single label like
+    "v1.2 [SDXL] (id 12345)" so the picker is informative even when
+    multiple versions share a similar name.
+    """
+    q = _require_questionary()
+    name = version.get("name") or "Unnamed"
+    base = version.get("baseModel") or "?"
+    vid = version.get("id")
+    return q.Choice(f"{name} [{base}] (id {vid})", value=vid)
+
+
+def run_interactive_flow(
+    config: Dict[str, Any],
+    args: argparse.Namespace
+) -> argparse.Namespace:
+    """Populate `args` via prompts and return the same namespace.
+
+    Mutates the namespace produced by argparse so the downstream logic
+    in main() doesn't have to know whether values came from flags or
+    prompts. Does one early API call to fetch model details — this is
+    what lets us offer a real version picker, which is the main reason
+    we picked questionary over a bash/Gum wrapper.
+    """
+    q = _require_questionary()
+    defaults = config.get("defaults", {})
+
+    # 0a) Status header — three lines of orientation so the user
+    #     doesn't have to Ctrl+C and `cat config.yaml` to remember
+    #     which vault they're targeting.
+    obsidian_cfg = config.get("obsidian", {})
+    civitai_cfg = config.get("civitai", {})
+    api_key_status = (
+        "set" if civitai_cfg.get("api_key") else "not set"
+    )
+    print(f"\n📂 Config:    {args.config}")
+    print(
+        f"🗄️  Vault:     {obsidian_cfg.get('vault_path', '(not set)')}"
+    )
+    print(f"🔑 API key:   {api_key_status}\n")
+
+    # 0b) Offer to add an API key when none is configured. The
+    #     unauthenticated rate limit (~100 req/min) is enough for a
+    #     small run but routinely throttles a 200-image fetch, so
+    #     pointing this out up front saves the user from discovering
+    #     it mid-run when a 429 backoff stretches a job to 15 minutes.
+    if not civitai_cfg.get("api_key"):
+        print(
+            "ℹ️  No CivitAI API key configured — you'll get the lower "
+            "unauthenticated\n   rate limits. Get one at: "
+            "https://civitai.com/user/account"
+        )
+        if _ask_or_exit(q.confirm(
+            "Enter an API key for this run?",
+            default=False
+        )):
+            new_key = _ask_or_exit(q.password(
+                "CivitAI API key:"
+            )).strip()
+            if new_key:
+                # Mutate the in-memory config so the fetcher built
+                # below picks it up; main() also reads from the same
+                # config dict, so a single assignment covers both
+                # the prefetch and the actual run.
+                config.setdefault("civitai", {})["api_key"] = new_key
+                civitai_cfg = config["civitai"]
+                if _ask_or_exit(q.confirm(
+                    "Save the key to config.yaml for future runs?",
+                    default=True
+                )):
+                    # save_to_config strips comments via safe_dump —
+                    # the API key is a secret-ish value the user
+                    # almost certainly wants persisted, so warning
+                    # would be more annoying than helpful here. The
+                    # heavier warning lives on the save-defaults
+                    # prompt below where the choice is more optional.
+                    try:
+                        save_to_config(
+                            args.config,
+                            {"civitai": {"api_key": new_key}}
+                        )
+                        print(f"✅ Saved to {args.config}\n")
+                    except Exception as exc:
+                        print(
+                            f"⚠️  Couldn't save to {args.config}: "
+                            f"{exc}\n   The key will be used for "
+                            f"this run only.\n"
+                        )
+
+    # 1) Model URL / ID
+    def _validate_model(s: str) -> Any:
+        if not s.strip():
+            return "Required"
+        # Use the same extractor the rest of the script uses so the
+        # validation surface matches: anything CivitAIFetcher accepts is
+        # fine here, anything it would reject we reject up front. Called
+        # as a staticmethod so we don't build a session/retry adapter
+        # purely to validate a string.
+        try:
+            CivitAIFetcher.extract_model_id(s.strip())
+        except ValueError as exc:
+            return str(exc)
+        return True
+
+    model_input = _ask_or_exit(q.text(
+        "CivitAI model URL or ID:",
+        validate=_validate_model
+    )).strip()
+
+    # 2) Prefetch model_data so we can show name/type and populate the
+    #    version picker with real choices. This is one wasted API call
+    #    relative to the run that follows, but it's worth it for the
+    #    UX win — the user gets to confirm "yes, that's the right
+    #    model" before committing to any downloads.
+    civitai_cfg = config.get("civitai", {})
+    rate_limits = config.get("rate_limits", {})
+    fetcher = CivitAIFetcher(
+        api_key=civitai_cfg.get("api_key"),
+        base_url=civitai_cfg.get(
+            "base_url", "https://civitai.com/api/v1"
+        ),
+        max_retries=rate_limits.get("max_retries", 3),
+        backoff_factor=rate_limits.get("backoff_factor", 1)
+    )
+
+    model_id, version_from_url = fetcher.extract_model_id(model_input)
+    print("\nFetching model details...")
+    try:
+        model_data = fetcher.get_model_details(model_id)
+    except Exception as exc:
+        print(f"❌ Couldn't fetch model {model_id}: {exc}")
+        sys.exit(1)
+
+    name = model_data.get("name", f"model_{model_id}")
+    mtype = model_data.get("type", "Unknown")
+    versions = model_data.get("modelVersions", []) or []
+    print(
+        f"✓ Found: {name} ({mtype}) — {len(versions)} version(s) available"
+    )
+
+    # 3) Version picker — only meaningful when the URL didn't already
+    #    pin one and the model has more than one version on file.
+    chosen_version_id: Optional[int] = version_from_url
+    if version_from_url is None and len(versions) > 1:
+        choices = [
+            q.Choice("All versions (let the script iterate)", value=None)
+        ] + [_build_version_choice(v) for v in versions]
+        chosen_version_id = _ask_or_exit(q.select(
+            "Which version do you want images for?",
+            choices=choices
+        ))
+
+    # Rebuild the model arg with the chosen version embedded so the
+    # downstream extract_model_id() call sees the same thing whether
+    # we got here interactively or via the CLI.
+    if chosen_version_id is not None:
+        args.model = (
+            f"https://civitai.com/models/{model_id}"
+            f"?modelVersionId={chosen_version_id}"
+        )
+    else:
+        args.model = str(model_id)
+
+    # 4) Update mode — asked early because:
+    #    (a) its answer drives the defaults for the sort/period prompts
+    #        that follow (CLI mode does the same swap at lines further
+    #        down in main()), and
+    #    (b) when update is on we run the same pre-flight checks main()
+    #        runs, so the user discovers a missing note immediately
+    #        rather than after walking through every other prompt.
+    args.update = _ask_or_exit(q.confirm(
+        "Update an existing note (append new images) instead of "
+        "generating fresh?",
+        default=False
+    ))
+
+    # 5) Pre-flight when updating: compute the same paths main() will
+    #    use and bail out now if the note or image folder is missing.
+    #    Duplicates the check inside main() but firing it here saves
+    #    the user from going through the rest of the prompts only to
+    #    hit a "note not found" wall.
+    if args.update:
+        generator = ObsidianPageGenerator(config=config)
+        formatted_title = generator.format_title(
+            model_data, chosen_version_id
+        )
+        page_filename = f"{formatted_title}.md"
+        note_dir = generator.get_note_directory(
+            model_data, chosen_version_id
+        )
+        note_path = note_dir / page_filename
+
+        folder_name = ObsidianPageGenerator.build_image_folder_name(
+            model_data, chosen_version_id
+        )
+        images_folder = generator.media_folder / folder_name
+
+        problems: List[str] = []
+        if not note_path.exists():
+            problems.append(
+                f"Obsidian note not found at:\n        {note_path}"
+            )
+        elif not note_path.is_file():
+            problems.append(
+                f"Path exists but is not a regular file:\n"
+                f"        {note_path}"
+            )
+        if not images_folder.exists():
+            problems.append(
+                f"Image folder not found at:\n        "
+                f"{images_folder}"
+            )
+        elif not images_folder.is_dir():
+            problems.append(
+                f"Image folder path exists but is not a "
+                f"directory:\n        {images_folder}"
+            )
+
+        if problems:
+            print(
+                "\n❌ Update mode can't run — these must exist first:"
+            )
+            for p in problems:
+                print(f"   • {p}")
+            print(
+                "\n   Run interactively without update mode first to "
+                "do an initial fetch, or verify the model name / "
+                "version ID matches the original run."
+            )
+            sys.exit(1)
+
+    # 6) Sort / period — defaults swap based on update mode to match
+    #    the CLI behavior: an update is looking for what's *new*, so
+    #    Newest/Month is a more useful starting point than the
+    #    Most Reactions/AllTime defaults used for fresh fetches.
+    if args.update:
+        sort_default = "Newest"
+        period_default = "Month"
+    else:
+        sort_default = defaults.get("sort_order", "Most Reactions")
+        period_default = defaults.get("time_period", "AllTime")
+
+    args.sort = _ask_or_exit(q.select(
+        "Sort order:",
+        choices=["Most Reactions", "Newest", "Most Comments"],
+        default=sort_default
+    ))
+
+    args.period = _ask_or_exit(q.select(
+        "Time period:",
+        choices=["AllTime", "Year", "Month", "Week", "Day"],
+        default=period_default
+    ))
+
+    # 7) NSFW
+    nsfw_default = defaults.get("nsfw_filter", "all")
+    args.nsfw = _ask_or_exit(q.select(
+        "NSFW filter:",
+        choices=[
+            q.Choice("All (no filter)", value="all"),
+            q.Choice("SFW only (block NSFW)", value="block"),
+            q.Choice("NSFW only", value="allow"),
+        ],
+        default=nsfw_default
+    ))
+
+    # 8) Limit — text input with a real integer validator
+    def _validate_limit(s: str) -> Any:
+        if not s.isdigit():
+            return "Enter a positive integer"
+        if int(s) <= 0:
+            return "Must be greater than zero"
+        return True
+
+    limit_str = _ask_or_exit(q.text(
+        "Maximum number of images to fetch:",
+        default=str(defaults.get("image_limit", 200)),
+        validate=_validate_limit
+    ))
+    args.limit = int(limit_str)
+
+    # 9) Quality filters — confirm prompts with True defaults to match
+    #    the script's "ship a curated library by default" stance.
+    args.require_meta = _ask_or_exit(q.confirm(
+        "Require generation metadata? (drops meta-less duds)",
+        default=_as_bool(defaults.get("require_meta"), True)
+    ))
+    args.filter_begging = _ask_or_exit(q.confirm(
+        "Filter out 'buzz please' / tip-begging prompts?",
+        default=_as_bool(defaults.get("filter_begging"), True)
+    ))
+
+    # 10) Skip-download — mutually exclusive with update mode, so only
+    #     prompt when update is off. Set the value explicitly in both
+    #     branches rather than relying on argparse's default; that way
+    #     a future change to argparse can't silently flip the meaning.
+    if args.update:
+        args.skip_download = False
+    else:
+        args.skip_download = _ask_or_exit(q.confirm(
+            "Skip downloads (write the .md only)?",
+            default=False
+        ))
+
+    # 11) Stash the prefetched model_data on the namespace so main()
+    #     can reuse it instead of fetching the same model twice. Using
+    #     an underscore-prefixed attribute to signal it's a private
+    #     side-channel between the interactive flow and main().
+    args._prefetched_model_data = model_data
+
+    # 12) Final summary so the user can sanity-check before any
+    #     rate-limited API work kicks off.
+    print("\n📋 Summary")
+    print(f"   Model:        {name} (ID {model_id})")
+    if chosen_version_id is not None:
+        version = next(
+            (v for v in versions if v.get("id") == chosen_version_id),
+            None
+        )
+        version_label = (
+            version.get("name") if version else str(chosen_version_id)
+        )
+        print(f"   Version:      {version_label}")
+    else:
+        print("   Version:      (all)")
+    print(f"   Update mode:  {args.update}")
+    print(f"   Sort:         {args.sort}")
+    print(f"   Period:       {args.period}")
+    print(f"   NSFW:         {args.nsfw}")
+    print(f"   Limit:        {args.limit}")
+    print(f"   Require meta: {args.require_meta}")
+    print(f"   Filter beg:   {args.filter_begging}")
+    print(f"   Skip dl:      {args.skip_download}")
+    print()
+
+    # 13) Offer to persist the run options as the new config defaults.
+    #     Update mode + skip-download are deliberately *not* saved —
+    #     they're per-run intentions, not standing preferences, and
+    #     persisting them would surprise the user on the next fresh
+    #     fetch (e.g. saving `update: true` would silently turn every
+    #     subsequent run into an update). Model and version are also
+    #     excluded for the obvious reason.
+    if _ask_or_exit(q.confirm(
+        "Save these options (sort, period, NSFW, limit, filters) as "
+        "the new defaults in config.yaml?",
+        default=False
+    )):
+        # yaml.safe_dump loses comments — flag this so a user who has
+        # invested in commenting their config can back out. The example
+        # file stays in the repo as a reference, so the docs aren't
+        # really lost, but the user's personal comments will be.
+        print(
+            "\n⚠️  This will rewrite config.yaml and any comments in "
+            "it will be stripped.\n   (config.example.yaml stays "
+            "intact as a reference.)"
+        )
+        if _ask_or_exit(q.confirm(
+            "Proceed with the save?",
+            default=True
+        )):
+            try:
+                save_to_config(args.config, {
+                    "defaults": {
+                        "image_limit": args.limit,
+                        "sort_order": args.sort,
+                        "time_period": args.period,
+                        "nsfw_filter": args.nsfw,
+                        "require_meta": args.require_meta,
+                        "filter_begging": args.filter_begging,
+                    }
+                })
+                print(f"✅ Defaults saved to {args.config}\n")
+            except Exception as exc:
+                print(
+                    f"⚠️  Couldn't save to {args.config}: {exc}\n"
+                    "   Continuing with this run — your settings "
+                    "weren't persisted.\n"
+                )
+
+    proceed = _ask_or_exit(q.confirm("Proceed?", default=True))
+    if not proceed:
+        print("👋 Cancelled.")
+        sys.exit(0)
+
+    return args
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch CivitAI model images and create Obsidian docs"
     )
     parser.add_argument(
         "model",
-        help="CivitAI model URL or ID"
+        nargs="?",
+        default=None,
+        help=(
+            "CivitAI model URL or ID. Optional when --interactive is set "
+            "(you'll be prompted for it)."
+        )
+    )
+    parser.add_argument(
+        "-i", "--interactive",
+        action="store_true",
+        help=(
+            "Drive the tool through arrow-key prompts instead of flags. "
+            "Includes a real version picker fetched from the API and a "
+            "first-run config wizard if config.yaml is missing."
+        )
     )
     parser.add_argument(
         "--api-key",
@@ -1188,6 +1816,15 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Either a model arg or --interactive must be provided. Catching this
+    # here (rather than via argparse) lets --interactive coexist with the
+    # positional `model` being optional, so power users can still mix the
+    # two if they want.
+    if not args.interactive and not args.model:
+        parser.error(
+            "model is required (or pass --interactive / -i to be prompted)"
+        )
+
     # --skip-download with --update would write entries pointing at
     # files that aren't on disk, leaving the note full of broken
     # embeds. Refuse the combo up front so the user can drop one or
@@ -1201,8 +1838,27 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # Load configuration
-    config = load_config(args.config)
+    # Interactive mode runs the first-run wizard if config.yaml is
+    # missing, then drives the option-collection through prompts and
+    # mutates `args` in place. Everything after this point is the same
+    # code path as the CLI-driven flow.
+    if args.interactive:
+        _require_questionary()
+        if not Path(args.config).exists():
+            run_config_wizard(args.config)
+        config = load_config(args.config)
+        args = run_interactive_flow(config, args)
+        # The flow may have flipped args.update on after the
+        # skip-download default was already set; re-check the
+        # mutual-exclusion guard so we fail loudly rather than later.
+        if args.update and args.skip_download:
+            print(
+                "❌ --update and --skip-download cannot be combined."
+            )
+            sys.exit(1)
+    else:
+        # Load configuration
+        config = load_config(args.config)
 
     # Override config with command-line arguments if provided
     if args.vault_path:
@@ -1255,11 +1911,11 @@ def main() -> None:
     # is more annoying to clean up than re-running with --no-...
     require_meta = (
         args.require_meta if args.require_meta is not None
-        else defaults.get("require_meta", True)
+        else _as_bool(defaults.get("require_meta"), True)
     )
     filter_begging = (
         args.filter_begging if args.filter_begging is not None
-        else defaults.get("filter_begging", True)
+        else _as_bool(defaults.get("filter_begging"), True)
     )
 
     # Compile begging patterns once, up front. Built-in patterns plus
@@ -1292,8 +1948,12 @@ def main() -> None:
             print(f"📌 Model Version ID: {model_version_id}")
         print()
 
-        # Fetch model details
-        model_data = fetcher.get_model_details(model_id)
+        # Fetch model details — or reuse the payload the interactive
+        # flow already pulled, so we don't hit the API twice for the
+        # same model in one session.
+        model_data = getattr(args, '_prefetched_model_data', None)
+        if model_data is None:
+            model_data = fetcher.get_model_details(model_id)
         model_name = generator.sanitize_filename(
             model_data.get("name", f"model_{model_id}")
         )
