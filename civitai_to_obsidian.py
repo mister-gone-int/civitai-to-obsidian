@@ -65,6 +65,12 @@ from _exif_writer import (
 )
 install_piexif_patches()
 
+# PNG repair lives in its own module so the same logic is reusable
+# from both the download path and any future on-disk repair tooling.
+# See _png_repair.py for the rationale (CivitAI CDN occasionally
+# serves PNGs with a bad chunk CRC even though the content is intact).
+from _png_repair import repair_png_bytes
+
 # Interactive mode is opt-in via --interactive; keep the import soft so a
 # user who never touches that flag doesn't need questionary installed.
 try:
@@ -579,6 +585,34 @@ class MergeResult(NamedTuple):
     added_keys: List[str]
     changed: bool
     notes: List[str]
+
+
+def _rescued_json_preserved(
+    roundtrip: Dict[str, Any], original_prompt: Any
+) -> bool:
+    """True if the JSON-shaped original prompt is preserved under
+    `Civitai source prompt` in the round-tripped dict.
+
+    Compares as JSON-semantic-equal (parsed structures, not raw
+    strings) because the A1111 params line flattens internal
+    whitespace inside JSON values (newlines → spaces during the
+    multi-line join). That whitespace shift is cosmetic, not data
+    loss — both sides decode to the same object — so the safety
+    net would otherwise reject SwarmUI / Civitai JSON prompts
+    purely on indentation differences. Falls back to byte-identical
+    string compare for cases where one side fails to parse.
+    """
+    csp = roundtrip.get("Civitai source prompt")
+    if csp is None:
+        return False
+    csp_s = str(csp).strip()
+    orig_s = str(original_prompt).strip()
+    if csp_s == orig_s:
+        return True
+    try:
+        return json.loads(csp_s) == json.loads(orig_s)
+    except (json.JSONDecodeError, ValueError):
+        return False
 
 
 def _looks_like_json_dump(s: Any) -> bool:
@@ -1299,9 +1333,19 @@ def enrich_file(
     # so the API's real prompt can take the prompt slot. We allow
     # that specific case by checking the rescued JSON is still
     # present under the side key.
+    #
+    # We iterate the NORMALIZED file_meta (canonical Title-Case keys)
+    # so that Civitai-style aliases like `cfgScale` don't appear
+    # missing from the round-trip — the merger already renamed them
+    # to their A1111 equivalent (`CFG scale`), and the safety net
+    # should follow the same convention. Empty values and synthesized
+    # composites (Size from width/height) are handled identically on
+    # both sides because the round-trip dict came from formatted
+    # canonical output.
     if file_meta:
         roundtrip = parse_a1111_params(new_params)
-        for k, v in file_meta.items():
+        file_meta_canon = _normalize_meta(file_meta)
+        for k, v in file_meta_canon.items():
             # Empty/whitespace-only file values are intentionally
             # dropped by _normalize_meta — they carry no information.
             # Their absence from the round-trip output is expected,
@@ -1312,10 +1356,9 @@ def enrich_file(
             if k not in roundtrip:
                 # Permit the JSON-prompt rescue: original prompt
                 # value is preserved under `Civitai source prompt`.
-                if k == "prompt" and _looks_like_json_dump(v):
-                    csp = roundtrip.get("Civitai source prompt")
-                    if csp and str(csp).strip() == str(v).strip():
-                        continue
+                if (k == "prompt" and _looks_like_json_dump(v)
+                        and _rescued_json_preserved(roundtrip, v)):
+                    continue
                 return EnrichResult(
                     EnrichStatus.ERROR,
                     [],
@@ -1329,10 +1372,9 @@ def enrich_file(
             if str(roundtrip[k]).strip() != str(v).strip():
                 # Same rescue permission: prompt value changed
                 # because we moved the JSON; check it's preserved.
-                if k == "prompt" and _looks_like_json_dump(v):
-                    csp = roundtrip.get("Civitai source prompt")
-                    if csp and str(csp).strip() == str(v).strip():
-                        continue
+                if (k == "prompt" and _looks_like_json_dump(v)
+                        and _rescued_json_preserved(roundtrip, v)):
+                    continue
                 return EnrichResult(
                     EnrichStatus.ERROR,
                     [],
@@ -1628,6 +1670,32 @@ class CivitAIFetcher:
                     f"(magic={content[:8].hex()})"
                 )
                 return None
+
+            # CivitAI's CDN occasionally serves PNGs with a bad CRC
+            # on the tEXt chunk holding generation parameters. The
+            # pixel data is fine, but PIL refuses to open the file
+            # — which breaks every downstream consumer (image library
+            # apps, the backfill enrich path, etc.). Repair the CRC
+            # in place before writing so the file we save is one PIL
+            # / browsers / SagaSigil can actually open. The repair
+            # never alters chunk content (only the 4-byte CRC field),
+            # so embedded metadata stays byte-identical.
+            if ext == "png":
+                rr = repair_png_bytes(content)
+                if rr.structural_error:
+                    # Beyond simple CRC bit-rot. Save the original
+                    # bytes verbatim — we won't make guesses on a
+                    # malformed file.
+                    print(
+                        f"      ⚠️  PNG repair skipped for "
+                        f"{image_id}: {rr.structural_error}"
+                    )
+                elif rr.notes:
+                    content = rr.data
+                    print(
+                        f"      🔧 Repaired {len(rr.notes)} bad "
+                        f"chunk CRC(s) in {image_id} (CDN defect)"
+                    )
 
             output_path = output_dir / f"{image_id}.{ext}"
             with open(output_path, 'wb') as f:
