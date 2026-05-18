@@ -2425,6 +2425,38 @@ class ObsidianPageGenerator:
                 matches.append(md_file)
         return matches
 
+    @classmethod
+    def note_embeds_from_folder(
+        cls,
+        content: str,
+        folder_name: str,
+    ) -> bool:
+        """True if any `![[...]]` embed in content lives under `folder_name`.
+
+        Used to disambiguate between several version-specific notes
+        that legitimately share the same model `source:` URL — each
+        version writes to its own `build_image_folder_name`-derived
+        folder, so the embeds inside each note point at that
+        version's folder. Matching that path segment is a robust
+        signal of which version a given note belongs to.
+
+        The match requires the folder to appear as an exact path
+        segment followed by a `<id>.<ext>` filename, so a partial
+        prefix collision (e.g. folder "Foo" vs "Foo Bar") can't
+        cause a false positive.
+        """
+        # `![[<anything>/<folder>/<id>.<ext><|...|#...>?]]`. The
+        # `<id>.<ext>` requirement is the same shape extract_image_
+        # ids_from_markdown matches, so we only count real image
+        # embeds — not random links that happen to mention the
+        # folder name.
+        pattern = re.compile(
+            r'!\[\[[^\]]*?/'
+            + re.escape(folder_name)
+            + r'/\d+\.\w+(?:[|#][^\]]*)?\]\]'
+        )
+        return bool(pattern.search(content))
+
     def build_update_section(
         self,
         new_images: List[Dict[str, Any]],
@@ -2941,11 +2973,20 @@ class UpdatePreflight(NamedTuple):
     differ when the user renamed the note and we fell back to a
     `source:` frontmatter match. Callers must write back to this
     path, not the original computed path.
+
+    `disambiguated_from` lists all the source-matching candidate
+    notes when more than one was found AND embed-folder
+    disambiguation picked exactly one of them. None means no
+    disambiguation was needed (either zero or one candidate found,
+    or we used the fast default-path branch). Callers use this to
+    explain to the user why a particular note was selected from
+    multiple matches.
     """
     problems: List[str]
     warning: Optional[str]
     existing_content: Optional[str]
     resolved_note_path: Optional[Path] = None
+    disambiguated_from: Optional[List[Path]] = None
 
 
 def check_update_preflight(
@@ -2985,6 +3026,7 @@ def check_update_preflight(
     # sets the resolved path), so callers never see compound or
     # contradictory note-resolution errors.
     resolved_note_path: Optional[Path] = None
+    disambiguated_from: Optional[List[Path]] = None
     if paths.note_path.exists():
         if paths.note_path.is_file():
             resolved_note_path = paths.note_path
@@ -3000,15 +3042,57 @@ def check_update_preflight(
         if len(candidates) == 1:
             resolved_note_path = candidates[0]
         elif len(candidates) > 1:
-            listed = '\n        '.join(str(p) for p in candidates)
-            problems.append(
-                "Multiple notes in this folder claim the same "
-                f"`source:` URL ({expected_source}).\n"
-                "      Refusing to guess which one to update — "
-                "please remove or rename the duplicates so exactly "
-                "one remains:\n"
-                f"        {listed}"
-            )
+            # Multi-version models legitimately produce several
+            # notes that share the same `source:` URL (one per
+            # version, since the source field doesn't carry
+            # version info). Disambiguate by checking which
+            # candidate's `![[...]]` embeds point at this run's
+            # version-specific image folder — that's the version
+            # this note belongs to.
+            target_folder = paths.images_folder.name
+            folder_matches = []
+            for candidate in candidates:
+                try:
+                    content = candidate.read_text(encoding='utf-8')
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if ObsidianPageGenerator.note_embeds_from_folder(
+                    content, target_folder
+                ):
+                    folder_matches.append(candidate)
+
+            if len(folder_matches) == 1:
+                resolved_note_path = folder_matches[0]
+                disambiguated_from = candidates
+            else:
+                listed = '\n        '.join(str(p) for p in candidates)
+                if len(folder_matches) > 1:
+                    extra = (
+                        "      Tried disambiguating by which note "
+                        f"embeds images from `{target_folder}`, but "
+                        f"{len(folder_matches)} notes embed from that "
+                        "folder — vault state is inconsistent.\n"
+                    )
+                elif not candidates:
+                    extra = ""
+                else:
+                    extra = (
+                        "      Tried disambiguating by which note "
+                        f"embeds images from `{target_folder}`, but "
+                        "none of the candidates do — pass the model "
+                        "version ID (e.g. `?modelVersionId=...`) so "
+                        "the image folder name picks out the right "
+                        "note.\n"
+                    )
+                problems.append(
+                    "Multiple notes in this folder claim the same "
+                    f"`source:` URL ({expected_source}).\n"
+                    + extra
+                    + "      Refusing to guess which one to update — "
+                    "please remove or rename the duplicates so "
+                    "exactly one remains:\n"
+                    f"        {listed}"
+                )
         else:
             problems.append(
                 f"Obsidian note not found at:\n      {paths.note_path}\n"
@@ -3065,7 +3149,8 @@ def check_update_preflight(
         return UpdatePreflight(problems, None, None)
 
     return UpdatePreflight(
-        [], warning, existing_content, resolved_note_path
+        [], warning, existing_content, resolved_note_path,
+        disambiguated_from,
     )
 
 
@@ -3142,6 +3227,50 @@ def check_fresh_fetch_safety(
         problems.append('\n'.join(lines))
 
     return problems
+
+
+def _print_resolved_note_notice(
+    resolved_note_path: Path,
+    disambiguated_from: Optional[List[Path]],
+    target_folder_name: str,
+) -> None:
+    """Print the "we located this note via fallback" notice.
+
+    Shared by main() and the interactive flow so both flows
+    describe the resolution with identical wording.
+
+    Two cases produce slightly different output:
+
+    1. Unique source match (rename only): the user moved/renamed a
+       single note away from the computed default filename, and
+       the source-frontmatter lookup found it.
+
+    2. Multi-candidate match disambiguated by image-folder embeds:
+       several notes shared the same `source:` URL (typical of
+       multi-version models), and we picked the one embedding
+       images from the version-specific folder. List the other
+       candidates so the user can verify the pick is correct.
+    """
+    if disambiguated_from and len(disambiguated_from) > 1:
+        others = [p for p in disambiguated_from if p != resolved_note_path]
+        print(
+            "\nℹ️  Note located via `source:` frontmatter + image-"
+            "folder match (multi-version disambiguation):\n"
+            f"   {resolved_note_path}\n"
+            f"   {len(disambiguated_from)} notes shared this source "
+            "URL; picked the one embedding from "
+            f"`{target_folder_name}`."
+        )
+        if others:
+            print("   Other candidates (not modified):")
+            for p in others:
+                print(f"     • {p}")
+    else:
+        print(
+            "\nℹ️  Note located via `source:` frontmatter "
+            "(renamed from default):\n"
+            f"   {resolved_note_path}"
+        )
 
 
 def _build_version_choice(version: Dict[str, Any]) -> Any:
@@ -3360,17 +3489,18 @@ def run_interactive_flow(
             sys.exit(1)
         if preflight.warning:
             print(f"\n⚠️  {preflight.warning}")
-        # If the preflight resolved to a renamed file, surface that
-        # now so the user can bail before answering more prompts if
-        # the match doesn't look right to them.
+        # If the preflight resolved to a different path than the
+        # computed default (rename and/or multi-version
+        # disambiguation), surface that now so the user can bail
+        # before answering more prompts if the match looks wrong.
         if (
             preflight.resolved_note_path is not None
             and preflight.resolved_note_path != preflight_paths.note_path
         ):
-            print(
-                "\nℹ️  Note located via `source:` frontmatter "
-                "(renamed from default):\n"
-                f"   {preflight.resolved_note_path}"
+            _print_resolved_note_notice(
+                preflight.resolved_note_path,
+                preflight.disambiguated_from,
+                preflight_paths.images_folder.name,
             )
     else:
         # Fresh-fetch safety: mirror the same early-bail discipline
@@ -3876,10 +4006,10 @@ def main() -> None:
             if preflight.resolved_note_path != target_paths.note_path:
                 note_path = preflight.resolved_note_path
                 if not args.interactive:
-                    print(
-                        "\nℹ️  Note located via `source:` "
-                        "frontmatter (renamed from default):\n"
-                        f"   {note_path}"
+                    _print_resolved_note_notice(
+                        note_path,
+                        preflight.disambiguated_from,
+                        target_paths.images_folder.name,
                     )
 
             md_ids = (
