@@ -352,6 +352,31 @@ def _normalize_meta(meta: Any) -> Dict[str, Any]:
     return out
 
 
+# CommonMark recognizes `<tagname...>` as raw inline HTML when the
+# tagname is letter + [A-Za-z0-9-]*. Obsidian's Live Preview hands
+# those to the HTML parser, which treats unknown elements as unclosed
+# containers and silently swallows every following line — image
+# embeds stop rendering, formatting collapses. Civitai metadata
+# values (`triggerWords`, etc.) routinely carry tokens shaped like
+# `<SomeWord>` from prompts like `<SignWithtextINeedBuzz>`, so any
+# value emitted into plain markdown (i.e., not inside a fenced code
+# block) needs the angle brackets backslash-escaped.
+_RAW_HTML_TAG_RE = re.compile(
+    r"<(/?[A-Za-z][A-Za-z0-9-]*)((?:\s[^<>]*)?)(/?)>"
+)
+
+
+def _neutralize_raw_html(s: str) -> str:
+    r"""Backslash-escape angle brackets on CommonMark-recognized tag
+    patterns. `\<tag\>` renders as literal `<tag>` and is never
+    interpreted as HTML. Patterns with characters that disqualify
+    them as tag names (e.g. `<lora:foo>`) are left alone."""
+    return _RAW_HTML_TAG_RE.sub(
+        lambda m: "\\<" + m.group(1) + m.group(2) + m.group(3) + "\\>",
+        s,
+    )
+
+
 def _format_param_value(v: Any) -> str:
     """Render a value for the comma-separated params line.
 
@@ -2236,16 +2261,20 @@ class ObsidianPageGenerator:
                 f"**Negative Prompt:**\n```\n{neg_prompt}\n```\n"
             )
 
-        # Other parameters
+        # Other parameters. Values pass through _neutralize_raw_html so
+        # tag-shaped tokens like `<SignWithtextINeedBuzz>` can't be
+        # parsed as raw HTML and eat the rest of the document.
         other_params = []
         for key in important_keys:
             if key in meta and key not in ["prompt", "negativePrompt"]:
-                other_params.append(f"- **{key}:** {meta[key]}")
+                rendered = _neutralize_raw_html(str(meta[key]))
+                other_params.append(f"- **{key}:** {rendered}")
 
         # Add any remaining params not in important_keys or excluded
         for key, value in meta.items():
             if key not in important_keys and key not in excluded_keys:
-                other_params.append(f"- **{key}:** {value}")
+                rendered = _neutralize_raw_html(str(value))
+                other_params.append(f"- **{key}:** {rendered}")
 
         if other_params:
             sections.append(
