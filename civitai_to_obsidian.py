@@ -27,7 +27,7 @@ import sys
 import time
 import zlib
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import yaml
 import requests
@@ -1413,6 +1413,40 @@ def enrich_file(
 # ---------------------------------------------------------------------
 
 
+class ImageFetchResult(NamedTuple):
+    """Outcome of a paginated image fetch.
+
+    Fields:
+
+    - `images`: items that passed every filter the caller supplied
+      via `accept_fn`. Length is at most `limit`.
+
+    - `pages_walked`: total API requests made across every version
+      queried — one per page. A pure single-call fetch reports 1.
+
+    - `candidates_seen`: count of image-typed items the API
+      returned across all pages (after the internal video skip).
+      Useful for "we walked the whole gallery and only found 3
+      matches" diagnostics.
+
+    - `drops_by_reason`: maps each reason returned by `accept_fn`
+      (e.g. "known", "no_meta", "begging") to its count. The
+      built-in video skip contributes under the `"video"` key.
+      `candidates_seen` == `len(images) + sum(non-video drops)`.
+
+    - `hit_page_limit`: True if pagination stopped at
+      `max_pages_per_version` for any version before exhausting
+      the cursor. Lets callers decide whether to raise the cap or
+      accept that the gallery genuinely doesn't contain enough
+      matches.
+    """
+    images: List[Dict[str, Any]]
+    pages_walked: int
+    candidates_seen: int
+    drops_by_reason: Dict[str, int]
+    hit_page_limit: bool
+
+
 class CivitAIFetcher:
     """Handles fetching data from CivitAI API"""
 
@@ -1524,6 +1558,12 @@ class CivitAIFetcher:
             return 'webp'
         return None
 
+    # CivitAI's /images endpoint caps a single request at 200
+    # results. Always ask for the max — we paginate via cursor for
+    # anything beyond, and a larger page size means fewer
+    # round-trips and less time spent on api_delay sleeps.
+    _IMAGES_API_PAGE_SIZE = 200
+
     def get_model_images(
         self,
         model_data: Dict[str, Any],
@@ -1532,29 +1572,79 @@ class CivitAIFetcher:
         period: str = "AllTime",
         nsfw: Optional[bool] = None,
         specific_version_id: Optional[int] = None,
-        api_delay: float = 1.5
-    ) -> List[Dict[str, Any]]:
-        """Fetch images for a model using modelVersionId
+        api_delay: float = 1.5,
+        accept_fn: Optional[
+            Callable[[Dict[str, Any]], Optional[str]]
+        ] = None,
+        max_pages_per_version: int = 25,
+    ) -> ImageFetchResult:
+        """Fetch up to `limit` images for a model, paginating as needed.
+
+        Walks `metadata.nextCursor` per the CivitAI API contract,
+        always requesting the API maximum (200) per call. For each
+        item returned, applies the built-in video filter and then
+        the optional `accept_fn`:
+
+        - `accept_fn(image) -> None`   → keep the image
+        - `accept_fn(image) -> "<r>"`  → drop, count under reason `r`
+
+        Pagination stops when any of these is true (in priority
+        order):
+
+        1. `limit` images have been accepted (target met)
+        2. The current response has no `nextCursor` (gallery
+           exhausted for this version)
+        3. `max_pages_per_version` API calls have been made for
+           this version (safety cap to bound runaway loops)
+
+        With multiple versions and no `specific_version_id`, each
+        version is walked in turn. The cursor is per-version — it
+        does not carry across versions.
 
         Args:
-            model_data: Model data from API
-            limit: Max images to fetch
-            sort: Sort order
-            period: Time period for sorting
-            nsfw: Filter NSFW content (True=allow, False=SFW, None=all)
-            specific_version_id: If provided, only fetch images for this
-                                version
-            api_delay: Delay between API calls
+            model_data: Model payload from /api/v1/models/:id
+            limit: Target count of accepted images (post-filter).
+                The function returns at most this many; it can
+                return fewer if the gallery is exhausted or
+                max_pages is hit.
+            sort: One of Most Reactions, Most Comments,
+                Most Collected, Newest, Oldest.
+            period: One of AllTime, Year, Month, Week, Day.
+            nsfw: True=NSFW-only, False=SFW-only, None=no filter.
+            specific_version_id: When set, only that version's
+                gallery is queried.
+            api_delay: Sleep between successive API calls. Honored
+                between pages and between versions.
+            accept_fn: Optional per-image predicate. Returns None
+                to keep, or a short reason string to drop. The
+                reason is counted under drops_by_reason in the
+                result.
+            max_pages_per_version: Safety cap on pages walked per
+                version. At the default 25 pages × 200 items, the
+                fetcher will examine up to 5000 candidates per
+                version before giving up — enough for any realistic
+                gallery while still bounding runaway pagination.
+
+        Returns:
+            ImageFetchResult with the accepted images, page count,
+            candidate count, per-reason drop counts (including
+            "video" for the built-in filter), and a flag indicating
+            whether the page cap was hit on any version.
         """
-        # Get all model versions
+        accepted: List[Dict[str, Any]] = []
+        drops: Dict[str, int] = {}
+        candidates_seen = 0
+        pages_walked = 0
+        hit_page_limit = False
+
         versions = model_data.get("modelVersions", [])
         if not versions:
             print("No model versions found")
-            return []
+            return ImageFetchResult(
+                accepted, pages_walked, candidates_seen,
+                drops, hit_page_limit
+            )
 
-        all_images: List[Dict[str, Any]] = []
-
-        # If specific version ID is provided, filter to that version only
         if specific_version_id:
             versions = [
                 v for v in versions if v.get("id") == specific_version_id
@@ -1564,77 +1654,152 @@ class CivitAIFetcher:
                     f"⚠️  Warning: Model version ID {specific_version_id} "
                     "not found in this model"
                 )
-                return []
+                return ImageFetchResult(
+                    accepted, pages_walked, candidates_seen,
+                    drops, hit_page_limit
+                )
             print(
                 f"🎯 Filtering to specific version ID: "
                 f"{specific_version_id}"
             )
 
-        # Fetch images for each version until we hit the limit
+        url = f"{self.base_url}/images"
+
         for version in versions:
-            if len(all_images) >= limit:
+            if len(accepted) >= limit:
                 break
 
             version_id = version.get("id")
             version_name = version.get("name", "Unknown")
-
             print(
                 f"Fetching images for version: {version_name} "
                 f"(ID: {version_id})..."
             )
 
-            url = f"{self.base_url}/images"
-            params: Dict[str, Any] = {
-                "modelVersionId": version_id,
-                "limit": min(limit - len(all_images), 200),
-                "sort": sort,
-                "period": period
-            }
+            cursor: Optional[Any] = None
+            pages_this_version = 0
+            error_on_this_version = False
 
-            # Add NSFW filter if specified
-            if nsfw is not None:
-                params["nsfw"] = str(nsfw).lower()
-
-            try:
-                response = self.session.get(
-                    url,
-                    params=params,
-                    timeout=30
-                )
-                response.raise_for_status()
-
-                data = response.json()
-                items = data.get("items", [])
-
-                # Filter out videos — CivitAI hosts MP4 clips alongside
-                # images, but we only embed images in Obsidian.
-                image_items = [
-                    i for i in items if i.get("type", "image") == "image"
-                ]
-                skipped = len(items) - len(image_items)
-
-                if image_items:
-                    all_images.extend(image_items)
-                    suffix = (
-                        f" (skipped {skipped} video(s))" if skipped else ""
+            while len(accepted) < limit:
+                if pages_this_version >= max_pages_per_version:
+                    hit_page_limit = True
+                    print(
+                        f"  ⚠️  Reached the page cap "
+                        f"({max_pages_per_version}) for this version "
+                        f"without filling the target. Raise "
+                        f"max_pages_per_version if you need to walk "
+                        "deeper into the gallery."
                     )
-                    print(f"  ✓ Got {len(image_items)} images{suffix}")
-                elif skipped:
-                    print(f"  All {skipped} items were videos — skipped")
-                else:
-                    print("  No images for this version")
+                    break
 
-            except Exception as e:
-                print(
-                    f"  Error fetching images for version "
-                    f"{version_id}: {e}"
+                params: Dict[str, Any] = {
+                    "modelVersionId": version_id,
+                    "limit": self._IMAGES_API_PAGE_SIZE,
+                    "sort": sort,
+                    "period": period,
+                }
+                if nsfw is not None:
+                    params["nsfw"] = str(nsfw).lower()
+                if cursor is not None:
+                    params["cursor"] = cursor
+
+                try:
+                    response = self.session.get(
+                        url, params=params, timeout=30
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                except Exception as e:
+                    print(
+                        f"  Error fetching images for version "
+                        f"{version_id}: {e}"
+                    )
+                    error_on_this_version = True
+                    break
+
+                items = data.get("items") or []
+                metadata = data.get("metadata") or {}
+
+                pages_walked += 1
+                pages_this_version += 1
+
+                page_kept = 0
+                page_videos = 0
+                page_drops: Dict[str, int] = {}
+
+                for item in items:
+                    if item.get("type", "image") != "image":
+                        page_videos += 1
+                        drops["video"] = drops.get("video", 0) + 1
+                        continue
+                    candidates_seen += 1
+                    if accept_fn is None:
+                        accepted.append(item)
+                        page_kept += 1
+                    else:
+                        reason = accept_fn(item)
+                        if reason is None:
+                            accepted.append(item)
+                            page_kept += 1
+                        else:
+                            drops[reason] = drops.get(reason, 0) + 1
+                            page_drops[reason] = (
+                                page_drops.get(reason, 0) + 1
+                            )
+                    if len(accepted) >= limit:
+                        break
+
+                # Per-page progress line. Show the running total
+                # vs target so the user can see when we're getting
+                # close to done. Skip on the trivial single-call
+                # case (1 page, no drops) to keep output tight.
+                detail_parts = []
+                if page_drops:
+                    drop_str = ', '.join(
+                        f'{n} {r}' for r, n in sorted(page_drops.items())
+                    )
+                    detail_parts.append(f"dropped: {drop_str}")
+                if page_videos:
+                    detail_parts.append(f"{page_videos} video(s)")
+                detail = (
+                    f" ({'; '.join(detail_parts)})" if detail_parts else ""
                 )
-                continue
+                print(
+                    f"  page {pages_this_version}: "
+                    f"got {len(items)} items, kept {page_kept}"
+                    f"{detail} — accepted {len(accepted)}/{limit}"
+                )
 
-            # API rate limiting
-            time.sleep(api_delay)
+                # Stop conditions: empty page (shouldn't normally
+                # happen) or no cursor for the next page (gallery
+                # exhausted for this version).
+                next_cursor = metadata.get("nextCursor")
+                if not items or next_cursor in (None, "", 0):
+                    break
+                cursor = next_cursor
 
-        return all_images[:limit]
+                # Rate limit only when we're going to make another
+                # call. Skip the sleep on the final page so the
+                # user doesn't wait pointlessly.
+                if len(accepted) < limit:
+                    time.sleep(api_delay)
+
+            # Between versions, honor api_delay too — but only if
+            # we actually plan to query another version.
+            if (
+                not error_on_this_version
+                and len(accepted) < limit
+                and version is not versions[-1]
+            ):
+                time.sleep(api_delay)
+
+        return ImageFetchResult(
+            images=accepted,
+            pages_walked=pages_walked,
+            candidates_seen=candidates_seen,
+            drops_by_reason=drops,
+            hit_page_limit=hit_page_limit,
+        )
 
     def download_image(
         self,
@@ -1697,9 +1862,30 @@ class CivitAIFetcher:
                         f"chunk CRC(s) in {image_id} (CDN defect)"
                     )
 
+            # Atomic write: stage the bytes in a dotfile sibling,
+            # fsync, then rename over the final path. This way a
+            # Ctrl-C or network drop mid-write never leaves a
+            # truncated `{id}.{ext}` on disk — the existence check
+            # in find_image_filename would otherwise treat that
+            # partial file as "already downloaded" and skip the
+            # re-download on the next run, leaving a broken embed.
+            # The leading `.` keeps the tmp file out of glob matches
+            # in find_image_filename and find_notes_by_source.
             output_path = output_dir / f"{image_id}.{ext}"
-            with open(output_path, 'wb') as f:
-                f.write(content)
+            tmp_path = output_dir / f".{image_id}.{ext}.tmp"
+            try:
+                with open(tmp_path, 'wb') as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                tmp_path.replace(output_path)
+            except Exception:
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                raise
 
             if api_meta:
                 result = enrich_file(output_path, api_meta)
@@ -2205,6 +2391,39 @@ class ObsidianPageGenerator:
         # closing fence doesn't end up with a blank line before it.
         new_block = new_block.rstrip('\r\n')
         return f'---\n{new_block}\n---\n{after_block}'
+
+    @classmethod
+    def find_notes_by_source(
+        cls,
+        note_dir: Path,
+        expected_source: str,
+    ) -> List[Path]:
+        """Find notes in `note_dir` whose frontmatter `source:` matches.
+
+        Fallback for update mode when the user has renamed a note away
+        from the computed default filename (e.g. to add a version or
+        print suffix). The `source:` field is the authoritative pointer
+        back to CivitAI and survives renames.
+
+        Non-recursive: only scans `note_dir` directly. Returns every
+        match so callers can detect ambiguity (e.g. two notes claiming
+        the same model) rather than silently picking one.
+        """
+        if not note_dir.is_dir():
+            return []
+        target = expected_source.rstrip('/')
+        matches: List[Path] = []
+        for md_file in sorted(note_dir.glob('*.md')):
+            try:
+                content = md_file.read_text(encoding='utf-8')
+            except (OSError, UnicodeDecodeError):
+                continue
+            source = cls.extract_frontmatter_field(content, 'source')
+            if source is None:
+                continue
+            if source.rstrip('/') == target:
+                matches.append(md_file)
+        return matches
 
     def build_update_section(
         self,
@@ -2717,10 +2936,16 @@ class UpdatePreflight(NamedTuple):
     `existing_content` is the note's text when read successfully (used
     by main() to compute already-known image IDs); None when the
     check bailed before reading the file.
+    `resolved_note_path` is the path of the note we actually located
+    — equal to the computed default in the common case, but may
+    differ when the user renamed the note and we fell back to a
+    `source:` frontmatter match. Callers must write back to this
+    path, not the original computed path.
     """
     problems: List[str]
     warning: Optional[str]
     existing_content: Optional[str]
+    resolved_note_path: Optional[Path] = None
 
 
 def check_update_preflight(
@@ -2748,15 +2973,50 @@ def check_update_preflight(
     differently") differs by context.
     """
     problems: List[str] = []
-    if not paths.note_path.exists():
-        problems.append(
-            f"Obsidian note not found at:\n      {paths.note_path}"
+
+    # Resolve the note path. Fast path = computed default. If the
+    # user has renamed the note (e.g. added a version or print
+    # suffix), fall back to scanning the note's directory for a
+    # markdown file whose frontmatter `source:` points at this
+    # model. The source field carries the model id and survives
+    # renames, making it the authoritative pointer.
+    #
+    # Exactly one of the three branches below adds a problem (or
+    # sets the resolved path), so callers never see compound or
+    # contradictory note-resolution errors.
+    resolved_note_path: Optional[Path] = None
+    if paths.note_path.exists():
+        if paths.note_path.is_file():
+            resolved_note_path = paths.note_path
+        else:
+            problems.append(
+                f"Path exists but is not a regular file:\n"
+                f"      {paths.note_path}"
+            )
+    else:
+        candidates = ObsidianPageGenerator.find_notes_by_source(
+            paths.note_path.parent, expected_source
         )
-    elif not paths.note_path.is_file():
-        problems.append(
-            f"Path exists but is not a regular file:\n"
-            f"      {paths.note_path}"
-        )
+        if len(candidates) == 1:
+            resolved_note_path = candidates[0]
+        elif len(candidates) > 1:
+            listed = '\n        '.join(str(p) for p in candidates)
+            problems.append(
+                "Multiple notes in this folder claim the same "
+                f"`source:` URL ({expected_source}).\n"
+                "      Refusing to guess which one to update — "
+                "please remove or rename the duplicates so exactly "
+                "one remains:\n"
+                f"        {listed}"
+            )
+        else:
+            problems.append(
+                f"Obsidian note not found at:\n      {paths.note_path}\n"
+                "      Also searched the surrounding folder for a "
+                f"note with `source: {expected_source}` in its "
+                "frontmatter and found none."
+            )
+
     if not paths.images_folder.exists():
         problems.append(
             f"Image folder not found at:\n      "
@@ -2771,7 +3031,9 @@ def check_update_preflight(
     if problems:
         return UpdatePreflight(problems, None, None)
 
-    existing_content = paths.note_path.read_text(encoding='utf-8')
+    # No problems means the resolution branch above produced a path.
+    assert resolved_note_path is not None
+    existing_content = resolved_note_path.read_text(encoding='utf-8')
     existing_source = (
         ObsidianPageGenerator.extract_frontmatter_field(
             existing_content, 'source'
@@ -2787,6 +3049,11 @@ def check_update_preflight(
             "before proceeding."
         )
     elif existing_source.rstrip('/') != expected_source:
+        # Can't trigger when we located the note via source-match
+        # fallback (we found it BY this exact source), but the
+        # check protects the fast-path branch where the file at
+        # the computed path may belong to a different model whose
+        # title happens to collide.
         problems.append(
             "The existing note at this path belongs to a different "
             "model.\n"
@@ -2797,7 +3064,84 @@ def check_update_preflight(
         )
         return UpdatePreflight(problems, None, None)
 
-    return UpdatePreflight([], warning, existing_content)
+    return UpdatePreflight(
+        [], warning, existing_content, resolved_note_path
+    )
+
+
+def check_fresh_fetch_safety(
+    note_path: Path,
+    expected_source: str,
+) -> List[str]:
+    """Return problem messages if a fresh fetch would clobber state.
+
+    Two scenarios are detected, in priority order:
+
+    1. One or more notes in `note_path.parent` already carry this
+       model's `source:` URL. That catches both the "default path is
+       still occupied" case and the "user renamed the note" case in
+       a single query — the source field is the authoritative model
+       id pointer and survives renames. A blind fresh fetch would
+       either wipe the user's manual edits (default path) or
+       silently create a duplicate alongside the renamed one. Either
+       outcome is almost never what the user wants; better to refuse
+       and steer them to `--update`.
+
+    2. A note already sits at the exact computed default path but
+       belongs to a DIFFERENT model (or has no `source:` field to
+       verify against). This is the most dangerous scenario — a
+       blind save_page would overwrite an unrelated note. Refuse
+       unconditionally; the user can move/rename the occupant.
+
+    An empty list means "safe to proceed" — no existing notes block
+    the write. Returning a list (rather than printing + sys.exit)
+    keeps this helper unit-testable and lets callers compose their
+    own error UX.
+    """
+    problems: List[str] = []
+    same_source_notes = ObsidianPageGenerator.find_notes_by_source(
+        note_path.parent, expected_source
+    )
+    if same_source_notes:
+        listed = '\n   • '.join(str(p) for p in same_source_notes)
+        problems.append(
+            "A note for this model already exists:\n"
+            f"   • {listed}\n\n"
+            "   To add more images to it, re-run with --update.\n"
+            "   To regenerate from scratch, delete the existing "
+            "note(s) first."
+        )
+        return problems
+
+    if note_path.exists():
+        try:
+            other_source = (
+                ObsidianPageGenerator.extract_frontmatter_field(
+                    note_path.read_text(encoding='utf-8'), 'source'
+                )
+            )
+        except OSError:
+            other_source = None
+        lines = [
+            "A note already occupies the target path:",
+            f"   {note_path}",
+        ]
+        if other_source:
+            lines.append(f"   That note's source: {other_source}")
+            lines.append(f"   This model's source: {expected_source}")
+        else:
+            lines.append(
+                "   That note has no `source:` field, so we can't "
+                "verify it belongs to a different model — refusing "
+                "to overwrite blind."
+            )
+        lines.append(
+            "\n   Move, rename, or delete that note first if you "
+            "want this model's note to take its place."
+        )
+        problems.append('\n'.join(lines))
+
+    return problems
 
 
 def _build_version_choice(version: Dict[str, Any]) -> Any:
@@ -2992,12 +3336,13 @@ def run_interactive_flow(
     #    through the rest of the prompts only to hit "note not found"
     #    or "wrong model" deeper in the run. The helper is the single
     #    source of truth — main() calls it too.
+    preflight_generator = ObsidianPageGenerator(config=config)
+    preflight_paths = compute_target_paths(
+        preflight_generator, model_data, chosen_version_id
+    )
+    expected_source = f"https://civitai.com/models/{model_id}"
+
     if args.update:
-        preflight_generator = ObsidianPageGenerator(config=config)
-        preflight_paths = compute_target_paths(
-            preflight_generator, model_data, chosen_version_id
-        )
-        expected_source = f"https://civitai.com/models/{model_id}"
         preflight = check_update_preflight(
             preflight_paths, expected_source
         )
@@ -3015,6 +3360,33 @@ def run_interactive_flow(
             sys.exit(1)
         if preflight.warning:
             print(f"\n⚠️  {preflight.warning}")
+        # If the preflight resolved to a renamed file, surface that
+        # now so the user can bail before answering more prompts if
+        # the match doesn't look right to them.
+        if (
+            preflight.resolved_note_path is not None
+            and preflight.resolved_note_path != preflight_paths.note_path
+        ):
+            print(
+                "\nℹ️  Note located via `source:` frontmatter "
+                "(renamed from default):\n"
+                f"   {preflight.resolved_note_path}"
+            )
+    else:
+        # Fresh-fetch safety: mirror the same early-bail discipline
+        # so an interactive user discovers a same-source / wrong-
+        # model conflict here, before answering the remaining
+        # prompts. main() runs the identical check again — that's
+        # the source of truth — but doing it here saves them
+        # from walking through five more questions for nothing.
+        safety_problems = check_fresh_fetch_safety(
+            preflight_paths.note_path, expected_source
+        )
+        if safety_problems:
+            print("\n❌ Fresh fetch can't run — fix the following first:")
+            for p in safety_problems:
+                print(f"\n   {p}")
+            sys.exit(1)
 
     # 6) Sort / period — defaults swap based on update mode to match
     #    the CLI behavior: an update is looking for what's *new*, so
@@ -3035,7 +3407,10 @@ def run_interactive_flow(
     if args.sort is None:
         args.sort = _ask_or_exit(q.select(
             "Sort order:",
-            choices=["Most Reactions", "Newest", "Most Comments"],
+            choices=[
+                "Most Reactions", "Most Comments", "Most Collected",
+                "Newest", "Oldest",
+            ],
             default=sort_default
         ))
 
@@ -3221,9 +3596,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--sort",
-        choices=["Most Reactions", "Newest", "Most Comments"],
+        choices=[
+            "Most Reactions", "Most Comments", "Most Collected",
+            "Newest", "Oldest",
+        ],
         default=None,
-        help="Sort order for images"
+        help=(
+            "Sort order for images. Most Reactions/Most Collected "
+            "are good quality proxies; Newest/Oldest are time-based."
+        )
     )
     parser.add_argument(
         "--period",
@@ -3484,6 +3865,23 @@ def main() -> None:
             assert preflight.existing_content is not None
             existing_content = preflight.existing_content
 
+            # If the preflight located the note via `source:` match
+            # (because the user renamed it away from the computed
+            # default), swap to the resolved path so the atomic
+            # append below writes back to the actual file, not the
+            # non-existent default. The interactive flow shows the
+            # rename notice itself (earliest opportunity for the
+            # user to bail) — suppress the duplicate print here.
+            assert preflight.resolved_note_path is not None
+            if preflight.resolved_note_path != target_paths.note_path:
+                note_path = preflight.resolved_note_path
+                if not args.interactive:
+                    print(
+                        "\nℹ️  Note located via `source:` "
+                        "frontmatter (renamed from default):\n"
+                        f"   {note_path}"
+                    )
+
             md_ids = (
                 ObsidianPageGenerator.extract_image_ids_from_markdown(
                     existing_content
@@ -3499,94 +3897,125 @@ def main() -> None:
                 f"\n🔁 Update mode: found {len(md_ids)} images in note "
                 f"and {len(disk_ids)} on disk ({len(known_ids)} unique)"
             )
+        else:
+            # Fresh-fetch safety: refuse before any API work if a
+            # same-source note already exists (renamed or not) or
+            # an unrelated note occupies the default path. This
+            # check is cheap (one folder scan) and saves the user
+            # from wasting an API quota burst + ~200 image
+            # downloads on a run that we'd refuse to write anyway.
+            safety_problems = check_fresh_fetch_safety(
+                note_path, f"https://civitai.com/models/{model_id}"
+            )
+            if safety_problems:
+                print("\n❌ Refusing fresh fetch:")
+                for p in safety_problems:
+                    print(f"\n   {p}")
+                sys.exit(1)
 
-        # Fetch images
+        # Build a single accept predicate that runs INSIDE the
+        # paginated fetch. This is the part that makes "--limit 200
+        # images I don't already have" work: by filtering as items
+        # arrive, the fetcher can keep walking pages (Most Reactions
+        # 201-400, 401-600, ...) past already-known images until it
+        # has collected `limit` final-quality matches. The previous
+        # design ran one API call and filtered the response after
+        # the fact, which silently capped the result at "200 minus
+        # however many were dups", so a long-time user re-fetching
+        # their best-of-AllTime model would net zero new images.
+        begging_samples: List[str] = []
+
+        def accept(img: Dict[str, Any]) -> Optional[str]:
+            img_id = img.get("id")
+            if img_id is None:
+                return "missing_id"
+            if args.update and img_id in known_ids:
+                return "known"
+            if require_meta and not img.get("meta"):
+                return "no_meta"
+            if filter_begging and begging_patterns:
+                matched = detect_begging_match(img, begging_patterns)
+                if matched is not None:
+                    # Stash a short sample so the funnel summary
+                    # can show what the filter caught, without
+                    # spamming on every drop.
+                    if len(begging_samples) < 5:
+                        prompt = (
+                            (img.get('meta') or {}).get('prompt') or ''
+                        )
+                        excerpt = prompt.strip().replace('\n', ' ')
+                        if len(excerpt) > 80:
+                            excerpt = excerpt[:77] + '...'
+                        begging_samples.append(
+                            f"      {img_id}: {excerpt!r}"
+                        )
+                    return "begging"
+            return None
+
+        # Fetch images (paginated, filtered in-flight by `accept`)
         print(f"📊 Sort order: {sort}")
         print(f"📅 Period: {period}")
         print(f"🔞 NSFW filter: {nsfw_arg}")
-        images_data = fetcher.get_model_images(
+        fetch_result = fetcher.get_model_images(
             model_data,
             limit=limit,
             sort=sort,
             period=period,
             nsfw=nsfw_param,
             specific_version_id=model_version_id,
-            api_delay=api_delay
+            api_delay=api_delay,
+            accept_fn=accept,
         )
+        images_data = fetch_result.images
 
-        api_count = len(images_data)
-        print(f"\n✅ Fetched {api_count} image(s) from API")
-
-        # Quality filters are applied in priority order: first drop
-        # already-processed images (cheapest, update-mode only), then
-        # require generation metadata (needed for downstream checks),
-        # then run the begging filter (most expensive — regex per
-        # prompt). Reporting is consolidated at the bottom so the user
-        # sees a single coherent funnel.
-        dropped_known = 0
-        if args.update:
-            before = len(images_data)
-            images_data = [
-                img for img in images_data
-                if img.get("id") not in known_ids
-            ]
-            dropped_known = before - len(images_data)
-
-        dropped_meta = 0
-        if require_meta:
-            before = len(images_data)
-            images_data = [
-                img for img in images_data if img.get('meta')
-            ]
-            dropped_meta = before - len(images_data)
-
-        dropped_begging = 0
-        begging_samples: List[str] = []
-        if filter_begging and begging_patterns:
-            kept: List[Dict[str, Any]] = []
-            for img in images_data:
-                matched = detect_begging_match(img, begging_patterns)
-                if matched is None:
-                    kept.append(img)
-                    continue
-                dropped_begging += 1
-                # Stash a short, human-readable sample for the summary
-                # so the user can verify the filter is doing the right
-                # thing without scrolling through a wall of output.
-                if len(begging_samples) < 5:
-                    prompt = (img.get('meta') or {}).get('prompt') or ''
-                    excerpt = prompt.strip().replace('\n', ' ')
-                    if len(excerpt) > 80:
-                        excerpt = excerpt[:77] + '...'
-                    begging_samples.append(
-                        f"      {img.get('id')}: {excerpt!r}"
-                    )
-            images_data = kept
-
-        # Funnel summary — only print the lines that actually fired so
-        # the output stays tight when filters didn't drop anything.
-        if dropped_known:
+        # Funnel summary — only emit lines that actually fired so
+        # output stays readable when filters didn't drop anything.
+        print(
+            f"\n✅ Walked {fetch_result.pages_walked} page(s), "
+            f"examined {fetch_result.candidates_seen} image candidate(s)"
+        )
+        drops = fetch_result.drops_by_reason
+        if drops.get("video"):
+            print(f"   → skipped {drops['video']} video item(s)")
+        if drops.get("missing_id"):
             print(
-                f"   → dropped {dropped_known} already in note/folder"
+                f"   → dropped {drops['missing_id']} item(s) with no id"
             )
-        if dropped_meta:
+        if drops.get("known"):
             print(
-                f"   → dropped {dropped_meta} without generation "
+                f"   → dropped {drops['known']} already in note/folder"
+            )
+        if drops.get("no_meta"):
+            print(
+                f"   → dropped {drops['no_meta']} without generation "
                 f"metadata"
             )
-        if dropped_begging:
+        if drops.get("begging"):
             print(
-                f"   → dropped {dropped_begging} matching the "
+                f"   → dropped {drops['begging']} matching the "
                 f"begging-spam filter"
             )
             for sample in begging_samples:
                 print(sample)
-            if dropped_begging > len(begging_samples):
+            if drops["begging"] > len(begging_samples):
                 print(
                     f"      ... and "
-                    f"{dropped_begging - len(begging_samples)} more"
+                    f"{drops['begging'] - len(begging_samples)} more"
                 )
         print(f"   → {len(images_data)} image(s) will be processed")
+
+        # Surface the page-cap warning at the top level so it's
+        # impossible to miss — this is the one case where the user
+        # may need to either widen sort/period or raise the cap to
+        # get the full target count.
+        if fetch_result.hit_page_limit and len(images_data) < limit:
+            print(
+                f"\n⚠️  Stopped at the per-version page cap before "
+                f"reaching {limit} matches. The gallery may not have "
+                "enough images matching your filters at this sort/"
+                "period — try widening with --period AllTime or a "
+                "different --sort."
+            )
 
         if not images_data:
             if args.update:
@@ -3737,7 +4166,9 @@ def main() -> None:
                 "images at the bottom."
             )
         else:
-            # Generate Obsidian page
+            # Fresh-fetch safety was verified up-front (before the
+            # API call), so by the time we land here we know the
+            # target path is clear to write.
             print("\n📝 Generating Obsidian page...")
             page_content = generator.generate_page(
                 model_data=model_data,
@@ -3749,7 +4180,7 @@ def main() -> None:
 
             generator.save_page(
                 page_content,
-                page_filename,
+                note_path.name,
                 model_data,
                 model_version_id
             )
